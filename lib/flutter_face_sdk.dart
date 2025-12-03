@@ -58,6 +58,7 @@ class Error implements Exception {
   static const PluginNoPermission = -31;
   static const FaceIDNotFound = -32;
   static const FaceImageNotFound = -33;
+  static const IBetaInitialization = -200;
 
   final int _code;
   final Object? _info;
@@ -205,6 +206,10 @@ class FaceImageNotFoundError extends Error {
   FaceImageNotFoundError(String callee, [Object? info]) : super(Error.FaceImageNotFound, callee, info);
 }
 
+class IBetaInitializationError extends Error {
+  IBetaInitializationError(String callee, [Object? info]) : super(Error.IBetaInitialization, callee, info);
+}
+
 final _ErrorTypes = {
   Error.Failed: (String callee, [Object? info]) => FailedError(callee, info),
   Error.NotActivated: (String callee, [Object? info]) => NotActivatedError(callee, info),
@@ -239,6 +244,7 @@ final _ErrorTypes = {
   Error.PluginNoPermission: (String callee, [Object? info]) => PluginNoPermissionError(callee, info),
   Error.FaceIDNotFound: (String callee, [Object? info]) => FaceIDNotFoundError(callee, info),
   Error.FaceImageNotFound: (String callee, [Object? info]) => FaceImageNotFoundError(callee, info)
+  Error.IBetaInitialization: (String callee, [Object? info]) => IBetaInitializationError(callee, info)
 };
 
 const FacialFeatureCount = 70;
@@ -1562,6 +1568,27 @@ class _GetLicenseInfoWrapper {
 }
 
 final GetLicenseInfo = _GetLicenseInfoWrapper();
+
+class _GetVersionInfoWrapper {
+
+  late int Function(Pointer<Pointer<Utf8>>) _func;
+
+  _GetLicenseInfoWrapper() {
+    _func = _nativeLib.lookup<NativeFunction<Int32 Function(Pointer<Pointer<Utf8>>)>>('FSDK_GetVersionInfo').asFunction();
+  }
+
+  String call() {
+    final var1 = malloc.allocate<Pointer<Utf8>>();
+    try {
+      _checkErrorCode(_func(var1), 'GetVersionInfo');
+      return var1.value.toDartString();
+    } finally {
+      malloc.free(var1);
+    }
+  }
+}
+
+final GetVersionInfo = _GetVersionInfoWrapper();
 
 class _SetNumThreadsWrapper {
 
