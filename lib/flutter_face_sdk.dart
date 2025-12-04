@@ -1504,17 +1504,28 @@ class Tracker extends Freeable {
 class _ActivateLibraryWrapper {
 
   late int Function(Pointer<Utf8>) _func;
+  late int Function(Pointer<Utf8>, Pointer<Utf8>) _setParamFunc;
 
   _ActivateLibraryWrapper() {
     _func = _nativeLib.lookup<NativeFunction<Int32 Function(Pointer<Utf8>)>>('FSDK_ActivateLibrary').asFunction();
+    _setParamFunc = _nativeLib.lookup<NativeFunction<Int32 Function(Pointer<Utf8>, Pointer<Utf8>)>>('FSDK_SetParameter').asFunction();
   }
 
   void call(String licenseKey) {
     final var1 = licenseKey.toNativeUtf8();
+
+    final environment = "environment";
+    final value = "flutter";
+    final env = environment.toNativeUtf8();
+    final val = value.toNativeUtf8();
+
     try {
+      _setParamFunc(env, val);
       _checkErrorCode(_func(var1), 'ActivateLibrary');
     } finally {
       malloc.free(var1);
+      malloc.free(env);
+      malloc.free(val);
     }
   }
 }
@@ -1619,15 +1630,7 @@ class _InitializeLibrary {
   _InitializeLibrary();
 
   void call() {
-    final int Function(Pointer<Utf8>, Pointer<Utf8>) func = _nativeLib.lookup<NativeFunction<Int32 Function(Pointer<Utf8>, Pointer<Utf8>)>>('FSDK_SetParameter').asFunction();
-    String environment = "environment";
-    String value = "Flutter";
-    final env = environment.toNativeUtf8();
-    final val = value.toNativeUtf8();
-    func(env, val);
     Initialize();
-    malloc.free(env);
-    malloc.free(val);
   }
 }
 
