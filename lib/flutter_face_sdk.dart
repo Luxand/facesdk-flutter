@@ -3381,7 +3381,6 @@ Future<String> _copyAssets() async
     'data/internal/7484fdb5bb69d3283c8aacd885ee50d8ce53f21c7bbfc33509185fe239f2ad41',
     'data/internal/b333d4da1a385777d90cb4d335383cb28b10d5319f6a8417d963ed01b5abacdb',
     'data/pipelines/pegasus.json',
-    'data/pipelines/persephone.json',
     'data/preprocessing/face_params.conf',
     'data/quality/exposition.conf'
   ];
