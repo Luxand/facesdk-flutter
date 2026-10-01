@@ -1,8 +1,6 @@
 ## [FaceSDK](https://www.luxand.com/facesdk/?utm_source=github&utm_medium=readmd&utm_campaign=header) · [CloudAPI](https://luxand.cloud/?utm_source=github&utm_medium=readmd&utm_campaign=header) · [LinkedIn](https://www.linkedin.com/company/luxand-inc.) · [Contact](mailto:support@luxand.com)
 
 
-<table style="border-collapse: collapse; border: none;">
-
 <img src="images/nist.png" align="left" width="145"> 
 
 ### NIST-approved
@@ -19,11 +17,15 @@ The iBeta certified Liveness add-on for FaceSDK aced Level 1 Presentation Attack
 
 ## ![image1](images/image1.jpg) ![image2](images/image2.jpg) 
 
-## Improved Face Detection and Recognition
+## Face Detection and Recognition
 
-The accuracy of face detection and recognition is significantly improved. Note that the face template size has been increased to 2068 bytes and the recognition threshold has been reduced. Threshold values as low as 0.8 provide good results in our tests.
+Luxand FaceSDK 9.0 ships a new detection and recognition pipeline. The accuracy of face detection and recognition is significantly improved compared to the previous release.
 
-Use the following classes and functions to use the improved algorithms.
+The face template is **1040 bytes**. Templates saved by an earlier version cannot be read by this one.
+
+`MatchFaces` returns the similarity value which is always in the range [0, 1] and 0.5 means "unrelated". A threshold of 0.64 gives good results in our tests.
+
+The classes used by detection are shown below.
 
 ```dart
 class Point extends Struct {
@@ -34,21 +36,16 @@ class Point extends Struct {
   external int y;
 }
 
-class FacePosition extends Struct {
-  @Int32()
-  external int xc;
+class PointF extends Struct {
+  @Float()
+  external double x;
 
-  @Int32()
-  external int yc;
+  @Float()
+  external double y;
+}
 
-  @Int32()
-  external int w;
-
-  @Int32()
-  external int padding;
-
-  @Double()
-  external double angle;
+class BBox extends Struct {
+  external Point p0, p1;
 }
 
 class FeaturePoints extends Struct {
@@ -57,69 +54,104 @@ class FeaturePoints extends Struct {
 }
 
 class Face extends Struct {
+  @Float()
+  external double score;
+
+  @Float()
+  external double angle;
+
   external BBox bbox;
   external FeaturePoints features;
 }
 ```
 
-*Use `Face` instead of `FacePosition` class when working with improved face detection. Points `p0` and `p1` correspond to top left and bottom right corner coordinates of the face bounding box. `features` contain 5 points detected on the face: eye centers, nose and mouth corners. Use `Faces` when working with the `DetectMultipleFaces2` function.*
+*`p0` and `p1` are the top left and bottom right corners of the face bounding box.
+`features` holds the 5 points detected on the face: eye centers, nose and mouth corners.
+`score` is the detection confidence and `angle` the in-plane rotation of the face.*
+
+*`FSDK.Face` is the class you actually work with; the listing above is the native layout it
+wraps. Besides `bbox` and `features` it exposes `left` / `top` / `right` / `bottom`,
+`width` / `height` and `center()`, so you rarely need to reach into `bbox` yourself. Use
+`FSDK.Faces` when working with the `DetectMultipleFaces` function.*
 
 ```dart
-FSDK.DetectFace2(FSDK.Image image, {FSDK.Face? face});
+FSDK.DetectFace(FSDK.Image image, {FSDK.Face? face});
 ```
 
-*Detects and returns a single face on the given image. If multiple faces are present, the function returns the one with the highest confidence. Setting the second argument is more efficient because it avoids the need to allocate memory for the face structure. You can also use this function from the Image class as follows:* ```FSDK.Face face = image.detectFace2();```
+*Detects and returns a single face on the given image. If multiple faces are present, the function returns the one with the highest confidence. Setting the second argument is more efficient because it avoids the need to allocate memory for the face structure. You can also use this function from the Image class as follows:* ```FSDK.Face face = image.detectFace();```
 
 ```dart
-FSDK.DetectMultipleFaces2(Image image, {Faces? faces, int maxSize = 256});
+FSDK.DetectMultipleFaces(FSDK.Image image, {FSDK.Faces? faces, int maxSize = 256});
 ```
 
-*Detects multiple faces on the given image. The faces are sorted by confidence in descending order.*
+*Detects multiple faces on the given image. The faces are sorted by confidence in descending order. Also available as* ```image.detectMultipleFaces()```.
 
 ```dart
-FSDK.GetFaceTemplate2(Image image, {FaceTemplate? faceTemplate});
+FSDK.GetFaceTemplate(FSDK.Image image, {FSDK.FaceTemplate? faceTemplate});
 ```
 
-*Obtains a face template for the face with the most confidence on the image (as returned by `DetectFace2` function). Note that the face template size is 2068 bytes.*
+*Obtains a face template for the face with the most confidence on the image (as returned by the `DetectFace` function). Also available as* ```image.getFaceTemplate()```.
 
 ```dart
-FSDK.GetFaceTemplateInRegion2(Image image, Face face, {FaceTemplate? faceTemplate});
+FSDK.GetFaceTemplateInRegion(FSDK.Image image, FSDK.Face face, {FSDK.FaceTemplate? faceTemplate});
 ```
 
-*Obtains a face template for the given `face`. Note that the face template size is 2068 bytes.*
+*Obtains a face template for the given `face`. Also available as* ```image.getFaceTemplateInRegion(face)```.
 
-### Configuring Improved Face Detection and Recognition
+### Configuring Face Detection and Recognition
 
-Parameters of the improved face detection and recognition are set using the `FSDK.SetParameter` or `FSDK.SetMultipleParameters` functions (see [documentation](https://www.luxand.com/facesdk/documentation/configuration.php)). The available parameters are listed below.
+Parameters are set using the `FSDK.SetParameter` or `FSDK.SetMultipleParameters` functions (see [documentation](https://www.luxand.com/facesdk/documentation/configuration.php)). The available parameters are listed below.
 
 #### Face Detection
 
 | Parameter | Description | Default Value | Accepted Values |
 | :---      | :---        |     :---:     | :---            |
-| FaceDetection2Model | Path to the face detection model file to load | default | File path or the string `"default"` |
-| FaceDetection2Threshold | Face detection threshold | 0.64 | Floating point value from the range [0, 1] |
-| FaceDetection2BatchSize | Number of image patches processed at the same time for face detection | 1 | Positive integer |
-| FaceDetection2PatchSize | Size of a single image patch | 640 | Positive integer. Higher values decrease performance, but allow detection of smaller faces |
-| FaceDetection2PatchMode | Image patching algorithm to use | fast | <p>`"fast"` &mdash; resizes the image to `FaceDetection2PatchSize` and performs detection on a single patch</p> <p>`"full"` &mdash; splits the image into overlapping patches of size `FaceDetection2PatchSize` and performs detection on every patch separately combing the results afterwards</p> <p>`"mixed"` &mdash; if the image size is at least twice as big as `FaceDetection2PatchSize` chooses `"full"` otherwise chooses `"fast"` |
-| FaceDetection2ComputationDelegate | Computation delegate to use for face detection | cpu | <p>`"none"` &mdash; run on CPU without SIMD optimizations</p> <p>`"cpu"` &mdash; run on CPU with SIMD optimizations</p> <p>`"gpu"` &mdash; run on GPU</p> <p>`"nnapi"` &mdash; run using [NNAPI](https://developer.android.com/ndk/guides/neuralnetworks)</p> |
+| FaceDetectionModel | Path to the face detection model file to load | default | File path or the string `"default"` |
+| FaceDetectionThreshold | Face detection threshold | 0.64 | Floating point value from the range [0, 1] |
+| FaceDetectionBatchSize | Number of image patches processed at the same time for face detection | 1 | Positive integer |
+| FaceDetectionPatchSize | Size of a single image patch | the model's own input size | Positive integer. Higher values decrease performance, but allow detection of smaller faces |
+| FaceDetectionPatchMode | Image patching algorithm to use | fast | <p>`"fast"` &mdash; resizes the image to `FaceDetectionPatchSize` and performs detection on a single patch</p> <p>`"full"` &mdash; splits the image into overlapping patches of size `FaceDetectionPatchSize` and performs detection on every patch separately combing the results afterwards</p> <p>`"mixed"` &mdash; if the image size is at least twice as big as `FaceDetectionPatchSize` chooses `"full"` otherwise chooses `"fast"` |
+| FaceDetectionBigFaceSize | Faces at least this large are detected on the whole image rather than per patch | 384 | Positive integer |
+| TrimOutOfScreenFaces | Clip bounding boxes that extend past the image border | true | `"false"` or `"true"` |
+| FaceDetectionComputationDelegate | Computation delegate to use for face detection | cpu | <p>`"none"` &mdash; run on CPU without SIMD optimizations</p> <p>`"cpu"` &mdash; run on CPU with SIMD optimizations</p> <p>`"gpu"` &mdash; run on GPU</p> <p>`"nnapi"` &mdash; run using [NNAPI](https://developer.android.com/ndk/guides/neuralnetworks)</p> |
+| FaceDetectionNumThreads | Number of threads used for face detection | automatic | Positive integer |
 
 #### Face Recognition
 
 | Parameter | Description | Default Value | Accepted Values |
 | :---      | :---        |     :---:     | :---            |
-| FaceRecognition2Model | Path to the face recognition model file to load | default | File path or the string `"default"` |
-| FaceRecognition2UseFlipTest | Additionally use mirrored image when creating face template | false | `"false"` or `"true"` |
-| FaceRecognition2ComputationDelegate | Computation delegate to use for face recognition | cpu | <p>`"none"` &mdash; run on CPU without SIMD optimizations</p> <p>`"cpu"` &mdash; run on CPU with SIMD optimizations</p> <p>`"gpu"` &mdash; run on GPU</p> <p>`"nnapi"` &mdash; run using [NNAPI](https://developer.android.com/ndk/guides/neuralnetworks)</p> |
+| FaceRecognitionModel | Path to the face recognition model file to load | default | File path or the string `"default"` |
+| FaceRecognitionUseFlipTest | Additionally use mirrored image when creating face template | false | `"false"` or `"true"` |
+| FaceRecognitionBatchSize | Number of faces processed at the same time | 1 | Positive integer |
+| FaceRecognitionComputationDelegate | Computation delegate to use for face recognition | cpu | Same values as `FaceDetectionComputationDelegate` |
+| FaceRecognitionNumThreads | Number of threads used for face recognition | automatic | Positive integer |
 
-### Activating Improved Face Detection and Recognition in Tracker
+#### Facial Features
 
-To activate improved face detection and recognition in Tracker set `DetectionVersion` Tracker parameter to `2`
+| Parameter | Description | Default Value | Accepted Values |
+| :---      | :---        |     :---:     | :---            |
+| FacialFeaturesModel | Path to the facial features model file to load | default | File path or the string `"default"` |
+| FacialFeaturesComputationDelegate | Computation delegate to use for facial feature detection | cpu | Same values as `FaceDetectionComputationDelegate` |
+| FacialFeaturesNumThreads | Number of threads used for facial feature detection | automatic | Positive integer |
+
+`ComputationDelegate` and `ModelNumThreads` set the delegate and the thread count for every
+model at once.
+
+### Face Detection and Recognition in Tracker
+
+The new detection and recognition are always used by the Tracker — the `DetectionVersion`
+parameter of the previous release no longer exists.
+
+All of the parameters above can be set for the Tracker using the `FSDK.SetTrackerParameter` and `FSDK.SetTrackerMultipleParameters` functions (see [documentation](https://www.luxand.com/facesdk/documentation/trackerfunctions.php#FSDK_SetTrackerParameter)), or through the `Tracker` class:
 
 ```dart
-tracker.setParameter('DetectionVersion', 2);
+tracker.setMultipleParameters({
+  'FaceDetectionPatchSize': 256,
+});
 ```
 
-Note that this parameter cannot be set for a non-empty Tracker, i.e. it must be set before the first call to `FSDK.FeedFrame`. Additionally, face detection and recognition parameters (as described [above](#set-parameters-of-the-improved-face-detection-and-recognition)) can be set using the `FSDK.SetTrackerParameter` and `FSDK.SetTrackerMultipleParameters` functions (see [documentation](https://www.luxand.com/facesdk/documentation/trackerfunctions.php#FSDK_SetTrackerParameter)).
+The Tracker overrides two of the detection defaults listed above: it uses
+`FaceDetectionThreshold=0.4` and `FaceDetectionPatchSize=256`.
 
 ## Managing Face Templates in Tracker Memory
 
@@ -128,7 +160,7 @@ The following functions can be used to synchronize Tracker Memory between differ
 Since the list of IDs in the Tracker may change during operation (for example, two IDs may be merged), it is not recommended to work with the Tracker (i.e., call `FSDK.FeedFrame`) while using the following functions. Also, you must call the following function beforehand (see [FAQ](https://www.luxand.com/facesdk/faq.php)):
 
 ```dart
-tracker.setParameter("VideoFeedDiscontinuity", false);
+tracker.setParameter("VideoFeedDiscontinuity", "false");
 ```
 Below is the list of functions for direct access to the Tracker Memory face templates.
 
@@ -151,7 +183,7 @@ int personId = tracker.getIDByFaceID(faceID);
 *Returns the person `ID` for the given `FaceID`. This function may be useful when the person `ID` changes during Tracker operation while the `FaceID` of the template remains unchanged, or when the `ID` is simply unknown. The `FaceID` always remains unchanged.*
 
 ```dart
-int faceIdsCount = tracker.getFaceIDsCountForID(faceID);
+int faceIdsCount = tracker.getFaceIDsCountForID(id);
 ```
 
 *Returns the number of face templates in the Tracker's database for the specified `ID` (person).*
@@ -166,19 +198,19 @@ FSDK.Int64Buffer faceIds = tracker.getFaceIDsForID(id);
 FSDK.FaceTemplate faceTemplate = tracker.getFaceTemplate(faceID);
 ```
 
-*Returns the face template for the specified `FaceID`.*
+*Returns the face template for the specified `FaceID`. The template is 1040 bytes long.*
 
 ```dart
 FSDK.TrackerCreateIDResult id = tracker.createID(faceTemplate);
 ```
 
-*Creates a new person `ID` and adds the provided template to it. Returns the new person `ID` and the associated `FaceID`. `FaceID` may be null, in which case the argument is unused.*
+*Creates a new person `ID` and adds the provided template to it. Returns a `TrackerCreateIDResult` carrying the new person `ID` and the associated `FaceID`.*
 
 ```dart
-tracker.addFaceTemplate(id, faceTemplate);
+int faceID = tracker.addFaceTemplate(id, faceTemplate);
 ```
 
-*Adds a new template to an existing person ID and returns the `FaceID`. `FaceID` may be null, in which case the argument is unused.* 
+*Adds a new template to an existing person `ID` and returns the `FaceID`.*
 
 ```dart
 tracker.deleteFace(faceID);
@@ -190,13 +222,13 @@ tracker.deleteFace(faceID);
 FSDK.Image image = tracker.getFaceImage(faceID);
 ```
 
-*Returns the face image for the specified `FaceID`. The image is grayscale and the dimensions are 96x96. If the image is not present, the function returns the error code `FSDKE_IMAGE_NOT_PRESENT`.*
+*Returns the face image for the specified `FaceID`. The dimensions are 112x112. Face images are stored when the `KeepFaceImages` Tracker parameter is `true`. If the image is not present, the function throws `FSDK.FaceImageNotFoundError`.*
 
 ```dart
 tracker.setFaceImage(faceID, faceImage);
 ```
 
-*Sets the face image for the specified `FaceID`. The dimensions of the provided `Image` must be 96x96. The `Image` may have any format supported by FSDK. If an image already exists for the `FaceID`, it will be replaced. This function should only be used with an `Image` obtained with `FSDK.GetTrackerFaceImage`.*
+*Sets the face image for the specified `FaceID`. The dimensions of the provided `Image` must be 112x112. If an image already exists for the `FaceID`, it will be replaced.*
 
 ```dart
 tracker.deleteFaceImage(faceID);
@@ -213,10 +245,10 @@ class IDSimilarity extends Struct {
   external double similarity; // similarity
 }
 
-List<FSDK.IDSimilarityResult> results = tracker.matchFaces(faceTemplate, threshold);
+FSDK.IDSimilarities results = tracker.matchFaces(faceTemplate, threshold);
 ```
 
-*Fills the list of `FSDK.IDSimilarityResult` with person `IDs` from the `tracker’s` memory that have a face `similarity` score above the `Threshold`. Each entry contains the person `ID` and the respective face `similarity`. Entries are added in descending order, so the `ID` with the highest `similarity` score appears first.*
+*Returns an `FSDK.IDSimilarities` list of person `IDs` from the `tracker’s` memory that have a face `similarity` score above the `threshold`. Each entry is an `IDSimilarity` holding the person `ID` and the respective face `similarity`. Entries are added in descending order, so the `ID` with the highest `similarity` score appears first. Pass `maxCount` to change the 1024 result limit, and reuse an `IDSimilarities` instance across calls to avoid reallocating.*
 
 ## iBeta Certified Liveness Addon
 

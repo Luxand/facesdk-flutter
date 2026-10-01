@@ -10,7 +10,7 @@ import 'package:image_picker/image_picker.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:url_launcher/url_launcher.dart';
 
-import 'faces_tracker.dart' show FacesTracker;
+import 'faces_tracker.dart' show FacesTracker, LivenessStatus;
 
 const luxandURL = 'https://www.luxand.com/facesdk';
 const luxandSwatch = MaterialColor(
@@ -29,17 +29,17 @@ const luxandSwatch = MaterialColor(
   }
 );
 
-
-bool useNewDetection = true;
-
-bool _hasStoragePermission = false;
 late List<CameraDescription> _cameras;
+
+// Result of FSDK.SetParameter("LivenessModel", ...): 0 means iBeta liveness is initialized.
+// null means the initialization was not attempted yet.
+int? _livenessInitResult;
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
 
   _cameras = await availableCameras();
-  _hasStoragePermission = await Permission.storage.request().isGranted;
+  await Permission.storage.request();
 
   runApp(const LiveRecognitionApp());
 }
@@ -90,7 +90,12 @@ class CameraPageState extends State<CameraPage> {
 
         // Initialize the iBeta liveness plugin
         FSDK.PrepareData().then((dataDirectory) {
-          FSDK.SetParameter("LivenessModel", "external:dataDir=$dataDirectory/");
+          try {
+            FSDK.SetParameter("LivenessModel", "external:dataDir=$dataDirectory/");
+            _livenessInitResult = FSDK.Error.Ok;
+          } on FSDK.Error catch (e) {
+            _livenessInitResult = e.code;
+          }
           _initialized = true;
         });
 
@@ -126,6 +131,7 @@ class FacesPainter extends CustomPainter {
 
   static const _drawFPS = true;
   static const _drawFeatures = false;
+  static const _fpsSmoothing = 0.1;
 
   static final _paintGreen = Paint()..color = Colors.green;
   static final _paintBlue  = Paint()..color = Colors.blue  ..style = PaintingStyle.stroke ..strokeWidth = 3;
@@ -134,6 +140,8 @@ class FacesPainter extends CustomPainter {
   final _stopwatch   = Stopwatch()..start();
   final _textPainter = TextPainter(textDirection: TextDirection.ltr);
 
+  double _fps = 0;
+
   final FacesTracker _tracker;
   final CameraController _controller;
 
@@ -141,6 +149,12 @@ class FacesPainter extends CustomPainter {
 
   @override
   void paint(Canvas canvas, Size size) {
+    if (_tracker.width <= 0 || _tracker.height <= 0) {
+      return;
+    }
+
+    _sampleFPS();
+
     final int width;
     final int height;
 
@@ -163,69 +177,87 @@ class FacesPainter extends CustomPainter {
 
     _faces.clear();
 
-    try {
-      for (final face in _tracker.faces()) {
+    for (final face in _tracker.faces) {
+      final tl = Offset(face.left,  face.top)   .scale(scale, scale).translate(offsetX, offsetY);
+      final br = Offset(face.right, face.bottom).scale(scale, scale).translate(offsetX, offsetY);
+      FaceRect rect = FaceRect(face.id, tl, br);
 
-        FaceRect rect;
+      _faces.add(rect);
+      canvas.drawRect(rect, _paintBlue);
 
-        if (useNewDetection) {
-          final facePosition = face.face;
-          
-          final tl = Offset(facePosition.left.toDouble(), facePosition.top.toDouble()).scale(scale, scale).translate(offsetX, offsetY);
-          final br = Offset(facePosition.right.toDouble(), facePosition.bottom.toDouble()).scale(scale, scale).translate(offsetX, offsetY);
-          rect = FaceRect(face.id, tl, br);  
-        } else {
-          final position = face.position;
-
-          final tl = Offset(position.xc - position.w / 2, position.yc - position.w / 2).scale(scale, scale).translate(offsetX, offsetY);
-          final br = Offset(position.xc + position.w / 2, position.yc + position.w / 2).scale(scale, scale).translate(offsetX, offsetY);
-          rect = FaceRect(face.id, tl, br);  
+      if (_drawFeatures) {
+        for (final point in face.features) {
+          canvas.drawCircle(Offset(point.x, point.y).scale(scale, scale).translate(offsetX, offsetY), 2, _paintGreen);
         }
-
-        _faces.add(rect);
-        canvas.drawRect(rect, _paintBlue);
-
-        if (_drawFeatures) {
-          for (final point in face.features) {
-            canvas.drawCircle(Offset(point.x.toDouble(), point.y.toDouble()).scale(scale, scale).translate(offsetX, offsetY), 2, _paintGreen);
-          }
-        }
-        
-        final name = face.name;
-        if (name.isNotEmpty) {
-          _textPainter.text = TextSpan(text: name);
-          _textPainter.layout();
-          _textPainter.paint(canvas, rect.bottomCenter.translate(-_textPainter.width / 2, 10));
-        }
-
-        bool live = face.checkLiveness();
-
-        double liveness = face.liveness;
-        String livenessError = face.livenessError;
-
-        String livenessText = "Liveness: ${liveness.toStringAsFixed(3)}";
-        if (livenessError.isNotEmpty) {
-          livenessText += " error: $livenessError";
-        }
-
-        _textPainter.text = TextSpan(
-          text: livenessText,
-          style: TextStyle(
-            color: live ? Colors.lightGreen : Colors.red,
-            fontSize: 14
-          )
-        );
-        _textPainter.layout();
-        _textPainter.paint(canvas, const Offset(10, 30));
-
       }
-    } on FSDK.IdNotFoundError {
-     // Tracker was cleared before previous ids were processed
+
+      if (face.name.isNotEmpty) {
+        _textPainter.text = TextSpan(text: face.name);
+        _textPainter.layout();
+        _textPainter.paint(canvas, rect.bottomCenter.translate(-_textPainter.width / 2, 10));
+      }
+
+      final status = face.livenessStatus;
+
+      // No Liveness attribute yet: nothing to report for this face
+      if (status == LivenessStatus.unknown) {
+        continue;
+      }
+
+      final liveness = face.liveness!;
+
+      // Liveness line, drawn only for a face that got a verdict
+      if (status == LivenessStatus.live || status == LivenessStatus.fake) {
+        final String livenessText;
+        final Color livenessColor;
+
+        if (status == LivenessStatus.live) {
+          livenessText = "Live (probability: ${liveness.toStringAsFixed(3)})";
+          livenessColor = Colors.lightGreen;
+        } else if (face.livenessError.isNotEmpty) {
+          livenessText = face.livenessError;
+          livenessColor = Colors.yellow;
+        } else {
+          livenessText = "Fake (probability: ${liveness.toStringAsFixed(3)})";
+          livenessColor = Colors.red;
+        }
+
+        _paintLabel(canvas, rect, livenessText, livenessColor, 30);
+      }
+
+      // Blurred face: no verdict, report the sharpness instead
+      if (status == LivenessStatus.blurred) {
+        _paintLabel(canvas, rect, "Low sharpness: ${face.sharpness!.toStringAsFixed(1)}", Colors.yellow, 30);
+      }
+
+      // Quality line
+      final quality = face.quality;
+      if (quality != null) {
+        final lowQuality = status == LivenessStatus.lowQuality;
+        _paintLabel(canvas, rect, "${lowQuality ? "Low Quality" : "Quality"}: ${quality.toStringAsFixed(3)}", Colors.lightGreen, 50);
+      }
+    }
+
+    // iBeta liveness initialization status, top left corner
+    if (_livenessInitResult != null) {
+      final initialized = _livenessInitResult == FSDK.Error.Ok;
+      _textPainter.text = TextSpan(
+        text: initialized
+          ? 'iBeta Liveness initialized'
+          : 'iBeta Liveness Not Initialized ($_livenessInitResult)',
+        style: TextStyle(
+          fontSize: 16,
+          color: initialized ? Colors.lightGreen : Colors.red,
+          fontWeight: FontWeight.bold
+        )
+      );
+      _textPainter.layout();
+      _textPainter.paint(canvas, const Offset(10, 30));
     }
 
     if (_drawFPS) {
       _textPainter.text = TextSpan(
-        text: (1000 / _stopwatch.elapsedMilliseconds).toStringAsFixed(1),
+        text: _fps.toStringAsFixed(1),
         style: const TextStyle(
           fontSize: 18,
           color: Colors.lightGreen,
@@ -235,9 +267,27 @@ class FacesPainter extends CustomPainter {
       _textPainter.layout();
       _textPainter.paint(canvas, const Offset(10, 10));
     }
+  }
 
+  void _paintLabel(Canvas canvas, Rect rect, String text, Color color, double offset) {
+    _textPainter.text = TextSpan(
+      text: text,
+      style: TextStyle(color: color, fontSize: 14)
+    );
+    _textPainter.layout();
+    _textPainter.paint(canvas, rect.bottomCenter.translate(-_textPainter.width / 2, offset));
+  }
+
+  void _sampleFPS() {
+    final elapsed = _stopwatch.elapsedMicroseconds;
     _stopwatch.reset();
-    _tracker.next();
+
+    if (elapsed <= 0) {
+      return;
+    }
+
+    final instant = Duration.microsecondsPerSecond / elapsed;
+    _fps = _fps == 0 ? instant : _fps + (instant - _fps) * _fpsSmoothing;
   }
 
   @override
@@ -283,11 +333,13 @@ class _FaceRecognitionPreviewState extends State<FaceRecognitionPreview> with Wi
 
   CameraLensDirection _lens = CameraLensDirection.front;
 
+  // `value.isInitialized` stays true after `dispose`, so it cannot tell a live
+  // controller from a disposed one and `CameraPreview` throws on the next frame.
+  bool _cameraOpen = false;
+
   @override
   void initState() {
-    super.initState();
-
-    _tracker.useNewDetection = useNewDetection;
+    super.initState();    
 
     WidgetsBinding.instance.addObserver(this);
 
@@ -300,6 +352,8 @@ class _FaceRecognitionPreviewState extends State<FaceRecognitionPreview> with Wi
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
+
+    _cameraOpen = false;
 
     _tracker.dispose();
     _controller.dispose();
@@ -351,8 +405,16 @@ class _FaceRecognitionPreviewState extends State<FaceRecognitionPreview> with Wi
   }
 
   Future _closeCamera() async {
-    if (!_controller.value.isInitialized) {
+    if (!_cameraOpen || !_controller.value.isInitialized) {
       return;
+    }
+
+    // Drop the preview before disposing, otherwise a frame can still rebuild
+    // against the disposed controller.
+    if (mounted) {
+      setState(() => _cameraOpen = false);
+    } else {
+      _cameraOpen = false;
     }
 
     if (_controller.value.isStreamingImages) {
@@ -369,12 +431,17 @@ class _FaceRecognitionPreviewState extends State<FaceRecognitionPreview> with Wi
     await _controller.initialize();
     await _controller.startImageStream(_process);
 
-    setState(() {});
+    if (!mounted) {
+      await _controller.dispose();
+      return;
+    }
+
+    setState(() => _cameraOpen = true);
   }
 
   @override
   Widget build(BuildContext context) {
-    if (!_controller.value.isInitialized) {
+    if (!_cameraOpen || !_controller.value.isInitialized) {
       return const Center(
         child: CircularProgressIndicator()
       );
@@ -445,106 +512,113 @@ class _FaceRecognitionPreviewState extends State<FaceRecognitionPreview> with Wi
         ),
         Align(
           alignment: Alignment.bottomCenter,
-          child: OverflowBar(
-            alignment: MainAxisAlignment.spaceAround,
-            children: <Widget>[
-              ElevatedButton(
-                style: _buttonStyle,
-                child: const Text('Match'),
-                onPressed: () async {
-                  final ImagePicker picker = ImagePicker();
-                  final XFile? image = await picker.pickImage(source: ImageSource.gallery);
-                  if (image != null) {
+          child: SafeArea(
+            // Keep the controls clear of the Android system navigation bar.
+            top: false,
+            child: OverflowBar(
+              alignment: MainAxisAlignment.spaceAround,
+              children: <Widget>[
+                ElevatedButton(
+                  style: _buttonStyle,
+                  child: const Text('Match'),
+                  onPressed: () async {
+                    final ImagePicker picker = ImagePicker();
+                    final XFile? image = await picker.pickImage(source: ImageSource.gallery);
+                    if (image != null) {
 
-                    String titleText = "";
-                    String contentText = "";
-                    try {
-                      final img = FSDK.Image.fromFile(image.path);
-                      final matchResult = _tracker.matchFace(img);
-                      if (matchResult.name.isEmpty) {
-                        titleText = "No match";
-                        contentText = "Can not find this face in the tracker DB.";
-                      } else {
-                        titleText = "Face found!";
-                        contentText = "The face matched with ${matchResult.name}, id: ${matchResult.id}, similarity: ${matchResult.similarity}";
+                      String titleText = "";
+                      String contentText = "";
+                      try {
+                        final img = FSDK.Image.fromFile(image.path);
+                        final matchResult = _tracker.matchFace(img);
+                        // An id is only named once someone taps its box and types a
+                        // name, so the name says nothing about whether it matched.
+                        if (matchResult.id < 0) {
+                          titleText = "No match";
+                          contentText = "Can not find this face in the tracker DB.";
+                        } else {
+                          titleText = "Face found!";
+                          final who = matchResult.name.isEmpty ? "an unnamed face" : matchResult.name;
+                          contentText = "The face matched with $who, id: ${matchResult.id}, similarity: ${matchResult.similarity}";
+                        }
+                      } on FSDK.FaceNotFoundError {
+                        titleText = "Error";
+                        contentText = "Face not found";
+                      } catch (e) {
+                        titleText = "Error";
+                        contentText = e.toString();
                       }
-                    } on FSDK.FaceNotFoundError {
-                      titleText = "Error";
-                      contentText = "Face not found";
-                    } catch (e) {
-                      titleText = "Error";
-                      contentText = e.toString();
-                    }
 
-                    showDialog(
-                      context: context,
-                      builder: (context) => AlertDialog(
-                        title: Text(titleText),
-                        content: Text(contentText),
-                        actions: <Widget>[
-                          TextButton(
-                            onPressed: () => Navigator.of(context).pop(),
-                            child: const Text('OK'),
-                          ),
-                        ],
-                      ),
-                    );
-                  }
-                },
-              ),
-              ElevatedButton(
-                style: _buttonStyle,
-                child: const Text('Flip'),
-                onPressed: () {
-                  _switchLens();
-                  _openCamera();
-                },
-              ),
-              ElevatedButton(
-                style: _buttonStyle,
-                child: const Text('Help'),                
-                onPressed: () => showAboutDialog(
-                  context: context,
-                  applicationIcon: const Image(image: AssetImage('graphics/icon.png')),
-                  applicationName: 'Live Recognition',
-                  applicationVersion: 'FaceSDK',
-                  applicationLegalese: '© Luxand, Inc.',
-                  children: <Widget>[
-                    RichText(
-                      text: TextSpan(
-                        children: <InlineSpan>[
-                          const TextSpan(
-                            text:
-                              '\nJust tap any detected face and name it. '
-                              'The app will recognize this face further. '
-                              'For best results, hold the device at arm\'s length. '
-                              'You may slowly rotate the head for the app to memorize you at multiple views. '
-                              'The app can memorize several persons. '
-                              'If a face is not recognized, tap and name it again.\n\n'
-                          ),
-                          const TextSpan(
-                            text: 'The SDK is available for developers: '
-                          ),
-                          TextSpan(
-                            text: luxandURL,
-                            style: const TextStyle(
-                              color: Colors.blue,
-                              decoration: TextDecoration.underline
+                      showDialog(
+                        context: context,
+                        builder: (context) => AlertDialog(
+                          title: Text(titleText),
+                          content: Text(contentText),
+                          actions: <Widget>[
+                            TextButton(
+                              onPressed: () => Navigator.of(context).pop(),
+                              child: const Text('OK'),
                             ),
-                            recognizer: TapGestureRecognizer() ..onTap = () => launchUrl(Uri.parse(luxandURL))
-                          )
-                        ]
-                      )
-                    )
-                  ]
+                          ],
+                        ),
+                      );
+                    }
+                  },
                 ),
-              ),
-              ElevatedButton(
-                style: _buttonStyle,
-                child: const Text('Clear'),
-                onPressed: () => _tracker.resetTracker(),
-              ),
-            ],
+                ElevatedButton(
+                  style: _buttonStyle,
+                  child: const Text('Flip'),
+                  onPressed: () {
+                    _switchLens();
+                    _openCamera();
+                  },
+                ),
+                ElevatedButton(
+                  style: _buttonStyle,
+                  child: const Text('Help'),                
+                  onPressed: () => showAboutDialog(
+                    context: context,
+                    applicationIcon: const Image(image: AssetImage('graphics/icon.png')),
+                    applicationName: 'Live Recognition',
+                    applicationVersion: 'FaceSDK',
+                    applicationLegalese: '© Luxand, Inc.',
+                    children: <Widget>[
+                      RichText(
+                        text: TextSpan(
+                          children: <InlineSpan>[
+                            const TextSpan(
+                              text:
+                                '\nJust tap any detected face and name it. '
+                                'The app will recognize this face further. '
+                                'For best results, hold the device at arm\'s length. '
+                                'You may slowly rotate the head for the app to memorize you at multiple views. '
+                                'The app can memorize several persons. '
+                                'If a face is not recognized, tap and name it again.\n\n'
+                            ),
+                            const TextSpan(
+                              text: 'The SDK is available for developers: '
+                            ),
+                            TextSpan(
+                              text: luxandURL,
+                              style: const TextStyle(
+                                color: Colors.blue,
+                                decoration: TextDecoration.underline
+                              ),
+                              recognizer: TapGestureRecognizer() ..onTap = () => launchUrl(Uri.parse(luxandURL))
+                            )
+                          ]
+                        )
+                      )
+                    ]
+                  ),
+                ),
+                ElevatedButton(
+                  style: _buttonStyle,
+                  child: const Text('Clear'),
+                  onPressed: () => _tracker.resetTracker(),
+                ),
+              ],
+            )
           )
         )
       ],

@@ -3,14 +3,13 @@ description: A new Flutter FFI plugin project.
 version: 0.0.1
 
 environment:
-  sdk: '>=2.19.5 <3.0.0'
+  sdk: ^3.9.0
   flutter: ">=2.11.0"
 
 dependencies:
   ffi: ^2.0.1
   flutter:
     sdk: flutter
-  plugin_platform_interface: ^2.0.2
   camera: ^0.11.2
   path_provider: ^2.0.2
 
@@ -65,6 +64,7 @@ flutter:
     - data/internal/7484fdb5bb69d3283c8aacd885ee50d8ce53f21c7bbfc33509185fe239f2ad41
     - data/internal/b333d4da1a385777d90cb4d335383cb28b10d5319f6a8417d963ed01b5abacdb
     - data/pipelines/pegasus.json
+    - data/pipelines/persephone.json
     - data/preprocessing/face_params.conf
     - data/quality/exposition.conf
    

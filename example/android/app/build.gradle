@@ -50,6 +50,17 @@ android {
         targetSdkVersion flutter.targetSdkVersion
         versionCode flutterVersionCode.toInteger()
         versionName flutterVersionName
+
+        // Opt-in ABI narrowing for development. A debug APK carries a ~40 MB
+        // libfsdk.so and a ~390 MB libflutter.so per ABI, so packaging them all
+        // pushes it past 1.5 GB and `adb install` gets killed part way through.
+        // Pass e.g. `flutter run -Ptargetabi=arm64-v8a` to build just one.
+        // Without the property every ABI is packaged, as before.
+        if (project.hasProperty('targetabi')) {
+            ndk {
+                abiFilters project.property('targetabi').split(',')
+            }
+        }
     }
 
     buildTypes {

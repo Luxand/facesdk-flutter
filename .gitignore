@@ -1,0 +1,28 @@
+# Flutter / Dart
+.dart_tool/
+.packages
+.flutter-plugins
+.flutter-plugins-dependencies
+build/
+**/ephemeral/
+
+# Android
+.gradle/
+local.properties
+*.iml
+.cxx/
+
+# iOS
+**/Pods/
+**/xcuserdata/
+**/Flutter/Generated.xcconfig
+**/Flutter/flutter_export_environment.sh
+**/Flutter/Flutter.podspec
+DerivedData/
+
+# IDE
+.idea/
+.vscode/
+.DS_Store
+
+*.bak

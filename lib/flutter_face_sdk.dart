@@ -1,3 +1,22 @@
+/// Dart bindings for the Luxand FaceSDK with the iBeta liveness pipeline.
+///
+/// Most functions that return a native object also accept an optional named
+/// parameter of that same type as their last argument. Every such object owns a
+/// native allocation, so returning a fresh one means allocating on every call.
+/// Passing an existing instance fills and returns that instead, which lets a
+/// per-frame loop allocate once and reuse it:
+///
+/// ```dart
+/// final face = Face.allocate();
+/// for (final frame in frames) {
+///   DetectFace(frame, face: face);
+/// }
+/// ```
+///
+/// Omit the parameter and a new instance is allocated for you, which is the
+/// simpler choice outside hot paths.
+library;
+
 import 'dart:collection';
 import 'dart:ffi';
 import 'dart:io';
@@ -58,6 +77,7 @@ class Error implements Exception {
   static const PluginNoPermission = -31;
   static const FaceIDNotFound = -32;
   static const FaceImageNotFound = -33;
+  static const IBetaInitialization = -200;
 
   final int _code;
   final Object? _info;
@@ -205,6 +225,10 @@ class FaceImageNotFoundError extends Error {
   FaceImageNotFoundError(String callee, [Object? info]) : super(Error.FaceImageNotFound, callee, info);
 }
 
+class IBetaInitializationError extends Error {
+  IBetaInitializationError(String callee, [Object? info]) : super(Error.IBetaInitialization, callee, info);
+}
+
 final _ErrorTypes = {
   Error.Failed: (String callee, [Object? info]) => FailedError(callee, info),
   Error.NotActivated: (String callee, [Object? info]) => NotActivatedError(callee, info),
@@ -238,24 +262,34 @@ final _ErrorTypes = {
   Error.PluginNotLoaded: (String callee, [Object? info]) => PluginNotLoadedError(callee, info),
   Error.PluginNoPermission: (String callee, [Object? info]) => PluginNoPermissionError(callee, info),
   Error.FaceIDNotFound: (String callee, [Object? info]) => FaceIDNotFoundError(callee, info),
-  Error.FaceImageNotFound: (String callee, [Object? info]) => FaceImageNotFoundError(callee, info)
+  Error.FaceImageNotFound: (String callee, [Object? info]) => FaceImageNotFoundError(callee, info),
+  Error.IBetaInitialization: (String callee, [Object? info]) => IBetaInitializationError(callee, info)
 };
 
 const FacialFeatureCount = 70;
 
 
+/// A resource holding native memory that can be released early with `free`.
 class Freeable {
 
   void free() {}
 
 }
 
-class _NativePointer<T extends NativeType> extends Freeable {
+class _NativePointer<T extends NativeType> extends Freeable implements Finalizable {
+
+  static final NativeFinalizer _finalizer = NativeFinalizer(malloc.nativeFree);
 
   final bool _owner;
   final Pointer<T> pointer;
 
-  _NativePointer(this.pointer, [this._owner = false]);
+  bool _freed = false;
+
+  _NativePointer(this.pointer, [this._owner = false]) {
+    if (_owner) {
+      _finalizer.attach(this, pointer.cast(), detach: this);
+    }
+  }
 
   factory _NativePointer.fromAddress(int address) {
     return _NativePointer(Pointer<T>.fromAddress(address));
@@ -267,31 +301,17 @@ class _NativePointer<T extends NativeType> extends Freeable {
 
   @override
   void free() {
-    if (_owner) {
-      malloc.free(pointer);
+    if (_freed || !_owner) {
+      return;
     }
-  }
-}
 
-class _AutoNativePointer<T extends NativeType> extends _NativePointer<T> {
-
-  final Finalizer<Pointer<T>> _finalizer = Finalizer((pointer) => malloc.free(pointer));
-
-  _AutoNativePointer(Pointer<T> pointer) : super(pointer) {
-    _finalizer.attach(this, pointer, detach: this);
-  }
-
-  factory _AutoNativePointer.allocate(int count) {
-    return _AutoNativePointer(malloc.allocate<T>(count));
-  }
-
-  @override
-  void free() {
+    _freed = true;
     _finalizer.detach(this);
-    super.free();
+    malloc.free(pointer);
   }
 }
 
+/// The addresses of a buffer and its length, for sharing a buffer across isolates.
 class BufferInfo {
 
   final int _dataAddress;
@@ -301,6 +321,7 @@ class BufferInfo {
 
 }
 
+/// A byte buffer to be used with FSDK functions.
 class DataBuffer extends ListBase<int> implements Freeable {
 
   late Uint8List _data;
@@ -308,8 +329,8 @@ class DataBuffer extends ListBase<int> implements Freeable {
   late _NativePointer<Uint8> _nativeData;
 
   DataBuffer.allocate(int length) {
-    _length = _AutoNativePointer<Int32>.allocate(sizeOf<Int32>())..pointer.value = length;
-    _nativeData = _AutoNativePointer<Uint8>.allocate(sizeOf<Uint8>() * length);
+    _length = _NativePointer<Int32>.allocate(sizeOf<Int32>())..pointer.value = length;
+    _nativeData = _NativePointer<Uint8>.allocate(sizeOf<Uint8>() * length);
     _data = _nativeData.pointer.asTypedList(length);
   }
 
@@ -354,7 +375,7 @@ class DataBuffer extends ListBase<int> implements Freeable {
       throw UnsupportedError("Cannot reallocate non owned pointers");
     }
 
-    final newNativeData = _AutoNativePointer<Uint8>.allocate(sizeOf<Uint8>() * newLength);
+    final newNativeData = _NativePointer<Uint8>.allocate(sizeOf<Uint8>() * newLength);
     final newData = newNativeData.pointer.asTypedList(newLength);
     newData.setRange(0, length, _data);
 
@@ -388,6 +409,7 @@ class DataBuffer extends ListBase<int> implements Freeable {
   }
 }
 
+/// A buffer of 64 bit integers to be used with FSDK functions.
 class Int64Buffer extends ListBase<int> implements Freeable {
 
   late Int64List _data;
@@ -395,8 +417,8 @@ class Int64Buffer extends ListBase<int> implements Freeable {
   late _NativePointer<Int64> _nativeData;
 
   Int64Buffer.allocate(int length) {
-    _length = _AutoNativePointer<Int64>.allocate(sizeOf<Int64>())..pointer.value = length;
-    _nativeData = _AutoNativePointer<Int64>.allocate(sizeOf<Int64>() * length);
+    _length = _NativePointer<Int64>.allocate(sizeOf<Int64>())..pointer.value = length;
+    _nativeData = _NativePointer<Int64>.allocate(sizeOf<Int64>() * length);
     _data = _nativeData.pointer.asTypedList(length);
   }
 
@@ -442,7 +464,7 @@ class Int64Buffer extends ListBase<int> implements Freeable {
       throw UnsupportedError("Cannot reallocate non owned pointers");
     }
 
-    final newNativeData = _AutoNativePointer<Int64>.allocate(sizeOf<Int64>() * newLength);
+    final newNativeData = _NativePointer<Int64>.allocate(sizeOf<Int64>() * newLength);
     final newData = newNativeData.pointer.asTypedList(newLength);
     newData.setRange(0, length, _data);
 
@@ -476,149 +498,8 @@ class Int64Buffer extends ListBase<int> implements Freeable {
   }
 }
 
-class _FacePosition extends Struct {
-
-  @Int32()
-  external int xc;
-
-  @Int32()
-  external int yc;
-
-  @Int32()
-  external int w;
-
-  @Int32()
-  external int padding;
-
-  @Double()
-  external double angle;
-
-}
-
-class FacePosition extends Freeable {
-
-  final _NativePointer<_FacePosition> _nativePointer;
-
-  Pointer<_FacePosition> get pointer => _nativePointer.pointer;
-
-  int get xc => pointer.ref.xc;
-  int get yc => pointer.ref.yc;
-  int get w  => pointer.ref.w;
-
-  set xc(int value) => pointer.ref.xc = value;
-  set yc(int value) => pointer.ref.yc = value;
-  set  w(int value) => pointer.ref.w  = value;
-
-  double get angle => pointer.ref.angle;
-  set angle(double value) => pointer.ref.angle = value;
-
-  FacePosition(this._nativePointer);
-
-  factory FacePosition.allocate() {
-    return FacePosition(_AutoNativePointer<_FacePosition>.allocate(sizeOf<_FacePosition>()));
-  }
-
-  factory FacePosition._allocate() {
-    return FacePosition.allocate();
-  }
-
-  factory FacePosition.fromPointer(Pointer<_FacePosition> pointer) {
-    return FacePosition(_NativePointer<_FacePosition>(pointer));
-  }
-
-  @override
-  void free() {
-    _nativePointer.free();
-  }
-}
-
-class FacePositions extends ListBase<FacePosition> implements Freeable {
-
-  late int _capacity;
-  late _NativePointer<Int32> _length;
-  late _NativePointer<_FacePosition> _nativeData;
-
-  FacePositions.allocate(int length) {
-    _capacity = length;
-    _length = _AutoNativePointer<Int32>.allocate(sizeOf<Int32>())..pointer.value = length;
-    _nativeData = _AutoNativePointer<_FacePosition>.allocate(sizeOf<_FacePosition>() * length);
-  }
-
-  factory FacePositions._allocate(int length) {
-    return FacePositions.allocate(length);
-  }
-
-  FacePositions.fromPointers(Pointer<_FacePosition> nativeData, Pointer<Int32> length) {
-    _length = _NativePointer<Int32>(length);
-    _nativeData = _NativePointer<_FacePosition>(nativeData);
-    _capacity = this.length;
-  }
-
-  FacePositions.fromAddresses(int nativeDataAddress, int lengthAddress) {
-    _length = _NativePointer<Int32>.fromAddress(lengthAddress);
-    _nativeData = _NativePointer<_FacePosition>.fromAddress(nativeDataAddress);
-    _capacity = length;
-  }
-
-  factory FacePositions.fromInfo(BufferInfo info) {
-    return FacePositions.fromAddresses(info._dataAddress, info._lengthAddress);
-  }
-
-  int get capacity => _capacity;
-  @override
-  int get length => _length.pointer.value;
-  Pointer<_FacePosition> get pointer => _nativeData.pointer;
-  Pointer<Int32> get _lengthPointer => _length.pointer;
-
-  @override
-  set length(int newLength) {
-    if (newLength <= _capacity) {
-      _length.pointer.value = newLength;
-      return;
-    }
-
-    if (!_nativeData._owner) {
-      throw UnsupportedError("Cannot reallocate non owned pointers");
-    }
-
-    final newNativeData = _AutoNativePointer<_FacePosition>.allocate(sizeOf<_FacePosition>() * newLength);
-    for (int i = 0; i < min(length, newLength); ++i) {
-      _assign(newNativeData.pointer[i], _nativeData.pointer[i]);
-    }
-
-    _nativeData.free();
-
-    _nativeData = newNativeData;
-    _length.pointer.value = newLength;
-    _capacity = newLength;
-  }
-
-  void _assign(_FacePosition a, _FacePosition b) {
-    a.xc = b.xc;
-    a.yc = b.yc;
-    a.w = b.w;
-    a.padding = b.padding;
-    a.angle = b.angle;
-  }
-
-  @override
-  FacePosition operator [](int index) => FacePosition.fromPointer(pointer.elementAt(index));
-
-  @override
-  void operator []=(int index, FacePosition pos) => _assign(_nativeData.pointer[index], pos.pointer.ref);
-
-  BufferInfo getInfo() {
-    return BufferInfo(_nativeData.pointer.address, _length.pointer.address);
-  }
-
-  @override
-  void free() {
-    _length.free();
-    _nativeData.free();
-  }
-}
-
-class Point extends Struct {
+/// A point with integer coordinates.
+final class Point extends Struct {
 
   @Int32()
   external int x;
@@ -634,31 +515,58 @@ class Point extends Struct {
   }
 }
 
-class FeaturePoints extends Struct {
+/// A point with floating point coordinates.
+final class PointF extends Struct {
+
+  @Float()
+  external double x;
+
+  @Float()
+  external double y;
+
+  static Pointer<PointF> allocate({required double x, required double y}) {
+    final p = malloc<PointF>();
+    p.ref.x = x;
+    p.ref.y = y;
+    return p;
+  }
+}
+
+/// The five key points carried by a detected face.
+final class FeaturePoints extends Struct {
   @Array(5)
   external Array<Point> points;
 }
 
-class BBox extends Struct {
+/// An axis-aligned bounding box given by two opposite corners.
+final class BBox extends Struct {
   external Point p0, p1;
 }
 
-class _Face extends Struct {
+final class _Face extends Struct {
+
+  @Float()
+  external double score;
+
+  @Float()
+  external double angle;
+
   external BBox bbox;
   external FeaturePoints features;
 }
 
+/// A detected face: its bounding box, detection score and key points.
 class Face extends Freeable {
 
   final _NativePointer<_Face> _nativePointer;
 
   BBox get bbox => _nativePointer.pointer.ref.bbox;
-  FeaturePoints get features => _nativePointer.pointer.ref.features;
+  List<Point> get features => _nativePointer.pointer.ref.features.points.elements;
 
   Face(this._nativePointer);
 
   factory Face.allocate() {
-    return Face(_AutoNativePointer<_Face>.allocate(sizeOf<_Face>()));
+    return Face(_NativePointer<_Face>.allocate(sizeOf<_Face>()));
   }
 
   factory Face._allocate() {
@@ -675,19 +583,29 @@ class Face extends Freeable {
 
   Pointer<_Face> get pointer => _nativePointer.pointer;
 
-  int get witdth => (bbox.p1.x - bbox.p1.x);  
+  int get width  => (bbox.p1.x - bbox.p0.x);
   int get height => (bbox.p1.y - bbox.p0.y);
+
   int get left => bbox.p0.x;
   int get top => bbox.p0.y;
   int get right => bbox.p1.x;
   int get bottom => bbox.p1.y;
+
+  double get leftAsDouble => bbox.p0.x.toDouble();
+  double get topAsDouble => bbox.p0.y.toDouble();
+  double get rightAsDouble => bbox.p1.x.toDouble();
+  double get bottomAsDouble => bbox.p1.y.toDouble();
 
   set left(int value) => bbox.p0.x = value;
   set top(int value) => bbox.p0.y = value;
   set right(int value) => bbox.p1.x = value;
   set bottom(int value) => bbox.p1.y = value;
 
-  set features(FeaturePoints value) => _nativePointer.pointer.ref.features = value;
+  set features(List<Point> value) {
+    for (var i = 0; i < 5; ++i){
+      _nativePointer.pointer.ref.features.points[i] ..x = value[i].x ..y = value[i].y;
+    }
+  }
 
   Pointer<Point> center() {
     int cx = ((bbox.p0.x + bbox.p1.x) ~/ 2).toInt();
@@ -701,6 +619,7 @@ class Face extends Freeable {
   }
 }
 
+/// A list of detected faces.
 class Faces extends ListBase<Face> implements Freeable {
 
   late int _capacity;
@@ -709,8 +628,8 @@ class Faces extends ListBase<Face> implements Freeable {
 
   Faces.allocate(int length) {
     _capacity = length;
-    _length = _AutoNativePointer<Int32>.allocate(sizeOf<Int32>())..pointer.value = length;
-    _nativeData = _AutoNativePointer<_Face>.allocate(sizeOf<_Face>() * length);
+    _length = _NativePointer<Int32>.allocate(sizeOf<Int32>())..pointer.value = length;
+    _nativeData = _NativePointer<_Face>.allocate(sizeOf<_Face>() * length);
   }
 
   factory Faces._allocate(int length) {
@@ -763,7 +682,7 @@ class Faces extends ListBase<Face> implements Freeable {
       throw ArgumentError('Cannot set length of unowned Faces');
     }
 
-    final newNativeData = _AutoNativePointer<_Face>.allocate(sizeOf<_Face>() * newLength);
+    final newNativeData = _NativePointer<_Face>.allocate(sizeOf<_Face>() * newLength);
     for (int i = 0; i < min(length, newLength); i++) {
       _assign(newNativeData.pointer[i], _nativeData.pointer[i]);
     }
@@ -776,7 +695,7 @@ class Faces extends ListBase<Face> implements Freeable {
 
   @override
   Face operator [](int index) {
-    return Face.fromPointer(pointer.elementAt(index));
+    return Face.fromPointer(pointer + index);
   }
 
   @override
@@ -793,50 +712,8 @@ class Faces extends ListBase<Face> implements Freeable {
   }
 }
 
-class Eyes extends Freeable {
-
-  final _NativePointer<Point> _nativePointer;
-
-  Eyes(this._nativePointer);
-
-  factory Eyes.allocate() {
-    return Eyes(_AutoNativePointer.allocate(sizeOf<Point>() * 2));
-  }
-
-  factory Eyes._allocate() {
-    return Eyes.allocate();
-  }
-
-  factory Eyes.fromPointer(Pointer<Point> pointer) {
-    return Eyes(_NativePointer<Point>(pointer));
-  }
-
-  factory Eyes.fromAddress(int address) {
-    return Eyes(_NativePointer<Point>.fromAddress(address));
-  }
-
-  Pointer<Point> get pointer => _nativePointer.pointer;
-
-  Point get left => pointer[0];
-  Point get right => pointer[1];
-
-  set left(Point point) => _setPoint(0, point);
-  set right(Point point) => _setPoint(1, point);
-
-  void _setPoint(int index, Point point) {
-    final value = pointer[index];
-    value.x = point.x;
-    value.y = point.y;
-  }
-
-  @override
-  void free() {
-    _nativePointer.free();
-  }
-
-}
-
-class FacialFeatures extends ListBase<Point> implements Freeable {
+/// The facial key points detected for a face.
+class FacialFeatures extends ListBase<PointF> implements Freeable {
 
   static const LeftEye = 0;
   static const RightEye = 1;
@@ -909,24 +786,24 @@ class FacialFeatures extends ListBase<Point> implements Freeable {
   static const FaceContour16 = 68;
   static const FaceContour17 = 69;
 
-  _NativePointer<Point> _nativePointer;
+  _NativePointer<PointF> _nativePointer;
 
   FacialFeatures(this._nativePointer);
 
   factory FacialFeatures.allocate() {
-    return FacialFeatures(_AutoNativePointer<Point>.allocate(sizeOf<Point>() * FacialFeatureCount));
+    return FacialFeatures(_NativePointer<PointF>.allocate(sizeOf<PointF>() * FacialFeatureCount));
   }
 
   factory FacialFeatures._allocate() {
     return FacialFeatures.allocate();
   }
 
-  factory FacialFeatures.fromPointer(Pointer<Point> pointer) {
-    return FacialFeatures(_NativePointer<Point>(pointer));
+  factory FacialFeatures.fromPointer(Pointer<PointF> pointer) {
+    return FacialFeatures(_NativePointer<PointF>(pointer));
   }
 
   factory FacialFeatures.fromAddress(int address) {
-    return FacialFeatures(_NativePointer<Point>.fromAddress(address));
+    return FacialFeatures(_NativePointer<PointF>.fromAddress(address));
   }
 
   @override
@@ -937,19 +814,17 @@ class FacialFeatures extends ListBase<Point> implements Freeable {
     throw UnsupportedError('Cannot resize FacialFeatures object');
   }
 
-  Pointer<Point> get pointer => _nativePointer.pointer;
+  Pointer<PointF> get pointer => _nativePointer.pointer;
 
   @override
-  Point operator [](int index) => pointer[index];
+  PointF operator [](int index) => pointer[index];
 
   @override
-  void operator []=(int index, Point point) {
+  void operator []=(int index, PointF point) {
     final value = pointer[index];
     value.x = point.x;
     value.y = point.y;
   }
-
-  Eyes get eyes => Eyes.fromPointer(pointer);
 
   @override
   void free() {
@@ -958,6 +833,7 @@ class FacialFeatures extends ListBase<Point> implements Freeable {
 
 }
 
+/// A face template representing a person.
 class FaceTemplate extends Freeable {
 
   final DataBuffer _buffer;
@@ -975,6 +851,9 @@ class FaceTemplate extends Freeable {
   DataBuffer get buffer => _buffer;
   Pointer<Uint8> get pointer => _buffer.pointer;
 
+  /// Get the similarity score between this template and another.
+  ///
+  /// - [other] the template to compare against
   double match(FaceTemplate other) {
     return MatchFaces(this, other);
   }
@@ -986,6 +865,7 @@ class FaceTemplate extends Freeable {
 
 }
 
+/// A face image extracted from a larger image, with its key points.
 class ExtractedFace {
 
   final Image image;
@@ -995,7 +875,8 @@ class ExtractedFace {
 
 }
 
-class IDSimilarity extends Struct {
+/// A tracker id and how similar it is to a queried template.
+final class IDSimilarity extends Struct {
   @Int64()
   external int id;
 
@@ -1003,6 +884,7 @@ class IDSimilarity extends Struct {
   external double similarity;
 }
 
+/// A list of tracker ids ranked by similarity.
 class IDSimilarities extends ListBase<IDSimilarity> implements Freeable {
 
   late int _capacity;
@@ -1011,8 +893,8 @@ class IDSimilarities extends ListBase<IDSimilarity> implements Freeable {
 
   IDSimilarities.allocate(int length) {
     _capacity = length;
-    _length = _AutoNativePointer<Int64>.allocate(sizeOf<Int64>())..pointer.value = length;
-    _nativeData = _AutoNativePointer<IDSimilarity>.allocate(sizeOf<IDSimilarity>() * length);
+    _length = _NativePointer<Int64>.allocate(sizeOf<Int64>())..pointer.value = length;
+    _nativeData = _NativePointer<IDSimilarity>.allocate(sizeOf<IDSimilarity>() * length);
   }
 
   factory IDSimilarities._allocate(int length) {
@@ -1052,7 +934,7 @@ class IDSimilarities extends ListBase<IDSimilarity> implements Freeable {
       throw UnsupportedError("Cannot reallocate non owned pointers");
     }
 
-    final newNativeData = _AutoNativePointer<IDSimilarity>.allocate(sizeOf<IDSimilarity>() * newLength);
+    final newNativeData = _NativePointer<IDSimilarity>.allocate(sizeOf<IDSimilarity>() * newLength);
     for (int i = 0; i < min(length, newLength); ++i) {
       _assign(newNativeData.pointer[i], _nativeData.pointer[i]);
     }
@@ -1102,6 +984,7 @@ void _checkErrorCode(int code, String callee, [_getInfoFunction? getInfo]) {
   throw _ErrorTypes[code]!(callee, info);
 }
 
+/// A wrapper object for an FSDK image.
 class Image extends Freeable {
 
   late _NativePointer<Uint32> _native;
@@ -1111,11 +994,11 @@ class Image extends Freeable {
   }
 
   factory Image._allocate() {
-    return Image._fromNativePointer(_AutoNativePointer<Uint32>.allocate(sizeOf<Uint32>()));
+    return Image._fromNativePointer(_NativePointer<Uint32>.allocate(sizeOf<Uint32>()));
   }
 
   factory Image.fromHandle(int handle) {
-    return Image._fromNativePointer(_AutoNativePointer<Uint32>.allocate(sizeOf<Uint32>())..pointer.value = handle);
+    return Image._fromNativePointer(_NativePointer<Uint32>.allocate(sizeOf<Uint32>())..pointer.value = handle);
   }
 
   factory Image.fromPointer(Pointer<Uint32> pointer) {
@@ -1129,6 +1012,9 @@ class Image extends Freeable {
     return CreateEmptyImage(image: image);
   }
 
+  /// Free the internal image buffer. The image becomes invalid.
+  ///
+  /// - [freePointer] false to release the native image but keep the handle cell alive
   @override
   void free({bool freePointer = true}) {
     FreeImage(this);
@@ -1137,148 +1023,228 @@ class Image extends Freeable {
     }
   }
 
+  /// Load an image from a file.
+  ///
+  /// - [fileName] path to the file
+  /// - [image] optional instance to fill and return; reusing one across calls skips an allocation
   factory Image.fromFile(String fileName, {Image? image}) {
     return LoadImageFromFile(fileName, image: image);
   }
 
+  /// Load an image from a file, preserving its alpha channel.
+  ///
+  /// - [fileName] path to the file
+  /// - [image] optional instance to fill and return; reusing one across calls skips an allocation
   factory Image.fromFileWithAlpha(String fileName, {Image? image}) {
     return LoadImageFromFileWithAlpha(fileName, image: image);
   }
 
+  /// Save the image into a file.
+  ///
+  /// - [fileName] path to the file
   void saveToFile(String fileName) {
     SaveImageToFile(this, fileName);
   }
 
+  /// Get image width.
   int get width {
     return GetImageWidth(this);
   }
 
+  /// Get image height.
   int get height {
     return GetImageHeight(this);
   }
 
+  /// Get a view over the image's own pixel buffer.
+  ///
+  /// The view is not a copy: it stays valid only while the image is left untouched.
+  ImageData getData() {
+    return GetImageData(this);
+  }
+
+  /// Load an image from a raw pixel buffer.
+  ///
+  /// - [buffer] the bytes to read from
+  /// - [width] width in pixels
+  /// - [height] height in pixels
+  /// - [scanLine] number of bytes per row in [buffer]
+  /// - [imageMode] the pixel format to encode with
+  /// - [image] optional instance to fill and return; reusing one across calls skips an allocation
   factory Image.fromBuffer(DataBuffer buffer, int width, int height, int scanLine, ImageMode imageMode, {Image? image}) {
     return LoadImageFromBuffer(buffer, width, height, scanLine, imageMode, image: image);
   }
 
+  /// Get the size in bytes of a buffer encoding the image in the given format.
+  ///
+  /// - [imageMode] the pixel format to encode with
   int getBufferSize(ImageMode imageMode) {
     return GetImageBufferSize(this, imageMode);
   }
 
+  /// Save the image into a byte buffer.
+  ///
+  /// - [imageMode] the pixel format to encode with
+  /// - [buffer] optional instance to fill and return; reusing one across calls skips an allocation
   DataBuffer saveToBuffer(ImageMode imageMode, {DataBuffer? buffer}) {
     return SaveImageToBuffer(this, imageMode, buffer: buffer);
   }
 
+  /// Load an image from a JPEG encoded buffer.
+  ///
+  /// - [buffer] the bytes to read from
+  /// - [image] optional instance to fill and return; reusing one across calls skips an allocation
   factory Image.fromJpegBuffer(DataBuffer buffer, {Image? image}) {
     return LoadImageFromJpegBuffer(buffer, image: image);
   }
 
+  /// Load an image from a PNG encoded buffer.
+  ///
+  /// - [buffer] the bytes to read from
+  /// - [image] optional instance to fill and return; reusing one across calls skips an allocation
   factory Image.fromPngBuffer(DataBuffer buffer, {Image? image}) {
     return LoadImageFromPngBuffer(buffer, image: image);
   }
 
+  /// Load an image from a PNG encoded buffer, preserving its alpha channel.
+  ///
+  /// - [buffer] the bytes to read from
+  /// - [image] optional instance to fill and return; reusing one across calls skips an allocation
   factory Image.fromPngBufferWithAlpha(DataBuffer buffer, {Image? image}) {
     return LoadImageFromPngBufferWithAlpha(buffer, image: image);
   }
 
-  FacePosition detectFace({FacePosition? facePosition}) {
-    return DetectFace(this, facePosition: facePosition);
+  /// Detect a single face. If several are present, returns the highest scoring one.
+  ///
+  /// - [face] optional instance to fill and return; reusing one across calls skips an allocation
+  Face detectFace({Face? face}) {
+    return DetectFace(this, face: face);
   }
 
-  Face detectFace2({Face? face}) {
-    return DetectFace2(this, face: face);
-  }
-
-  FacePositions detectMultipleFaces({FacePositions? faces, int maxSize = 256}) {
+  /// Detect multiple faces, sorted by detection score descending.
+  ///
+  /// - [faces] optional instance to fill and return; reusing one across calls skips an allocation
+  /// - [maxSize] the most results to return
+  Faces detectMultipleFaces({Faces? faces, int maxSize = 256}) {
     return DetectMultipleFaces(this, faces: faces, maxSize: maxSize);
   }
 
-  Faces detectMultipleFaces2({Faces? faces, int maxSize = 256}) {
-    return DetectMultipleFaces2(this, faces: faces, maxSize: maxSize);
-  }
-
+  /// Detect the facial key points of a single face.
+  ///
+  /// - [facialFeatures] optional instance to fill and return; reusing one across calls skips an allocation
   FacialFeatures detectFacialFeatures({FacialFeatures? facialFeatures}) {
     return DetectFacialFeatures(this, facialFeatures: facialFeatures);
   }
 
-  FacialFeatures detectFacialFeaturesInRegion(FacePosition facePosition, {FacialFeatures? facialFeatures}) {
-    return DetectFacialFeaturesInRegion(this, facePosition, facialFeatures: facialFeatures);
+  /// Detect the facial key points of a given face.
+  ///
+  /// - [face] the face region to work within
+  /// - [facialFeatures] optional instance to fill and return; reusing one across calls skips an allocation
+  FacialFeatures detectFacialFeaturesInRegion(Face face, {FacialFeatures? facialFeatures}) {
+    return DetectFacialFeaturesInRegion(this, face, facialFeatures: facialFeatures);
   }
 
-  Eyes detectEyes({Eyes? eyes}) {
-    return DetectEyes(this, eyes: eyes);
-  }
-
-  Eyes detectEyesInRegion(FacePosition facePosition, {Eyes? eyes}) {
-    return DetectEyesInRegion(this, facePosition, eyes: eyes);
-  }
-
+  /// Create a copy of the image.
   Image copy() {
     return CopyImage(this);
   }
 
+  /// Create a new image scaled by `ratio`.
+  ///
+  /// - [ratio] scale factor, where 1.0 keeps the original size
   Image resize(double ratio) {
     return ResizeImage(this, ratio);
   }
 
+  /// Create a new image rotated by 90 * `multiplier` degrees. Negative values rotate
+  /// counterclockwise.
+  ///
+  /// - [multiplier] number of 90 degree steps; negative values rotate counterclockwise
   Image rotate90(int multiplier) {
     return RotateImage90(this, multiplier);
   }
 
+  /// Create a new image rotated `angle` degrees around the center.
+  ///
+  /// - [angle] rotation in degrees
   Image rotate(double angle) {
     return RotateImage(this, angle);
   }
 
+  /// Create a new image rotated `angle` degrees around (`xCenter`, `yCenter`).
+  ///
+  /// - [angle] rotation in degrees
+  /// - [xCenter] x coordinate to rotate around
+  /// - [yCenter] y coordinate to rotate around
   Image rotateCenter(double angle, double xCenter, double yCenter) {
     return RotateImageCenter(this, angle, xCenter, yCenter);
   }
 
+  /// Copy the axis-aligned rectangle bounded by (`x1`, `y1`) and (`x2`, `y2`).
+  ///
+  /// - [x1] left edge of the rectangle
+  /// - [y1] top edge of the rectangle
+  /// - [x2] right edge of the rectangle
+  /// - [y2] bottom edge of the rectangle
   Image copyRect(int x1, int y1, int x2, int y2) {
     return CopyRect(this, x1, y1, x2, y2);
   }
 
+  /// As `copyRect`, but parts outside the image repeat the border pixels.
+  ///
+  /// - [x1] left edge of the rectangle
+  /// - [y1] top edge of the rectangle
+  /// - [x2] right edge of the rectangle
+  /// - [y2] bottom edge of the rectangle
   Image copyRectReplicateBorder(int x1, int y1, int x2, int y2) {
     return CopyRectReplicateBorder(this, x1, y1, x2, y2);
   }
 
+  /// Mirror the image around the vertical or horizontal axis.
+  ///
+  /// - [useVerticalMirroringInsteadOfHorizontal] true to mirror around the vertical axis, false for the horizontal one
   void mirror(bool useVerticalMirroringInsteadOfHorizontal) {
     MirrorImage(this, useVerticalMirroringInsteadOfHorizontal);
   }
 
+  /// Extract the part of the image containing the face, resized to `width` x `height`.
+  ///
+  /// - [facialFeatures] the key points locating the face in this image
+  /// - [width] width of the extracted image
+  /// - [height] height of the extracted image
+  /// - [extractedFaceImage] optional instance to fill and return; reusing one across calls skips an allocation
+  /// - [resizedFeatures] optional instance to fill and return; reusing one across calls skips an allocation
   ExtractedFace extractFace(FacialFeatures facialFeatures, int width, int height, {Image? extractedFaceImage, FacialFeatures? resizedFeatures}) {
     return ExtractFaceImage(this, facialFeatures, width, height, extractedFaceImage: extractedFaceImage, resizedFeatures: resizedFeatures);
   }
 
+  /// Get the face template of a single face.
+  ///
+  /// - [faceTemplate] optional instance to fill and return; reusing one across calls skips an allocation
   FaceTemplate getFaceTemplate({FaceTemplate? faceTemplate}) {
     return GetFaceTemplate(this, faceTemplate: faceTemplate);
   }
 
-  FaceTemplate getFaceTemplate2({FaceTemplate? faceTemplate}) {
-    return GetFaceTemplate2(this, faceTemplate: faceTemplate);
+  /// Get the face template of a given face.
+  ///
+  /// - [face] the face region to work within
+  /// - [faceTemplate] optional instance to fill and return; reusing one across calls skips an allocation
+  FaceTemplate getFaceTemplateInRegion(Face face, {FaceTemplate? faceTemplate}) {
+    return GetFaceTemplateInRegion(this, face, faceTemplate: faceTemplate);
   }
 
-  FaceTemplate getFaceTemplateInRegion(FacePosition facePosition, {FaceTemplate? faceTemplate}) {
-    return GetFaceTemplateInRegion(this, facePosition, faceTemplate: faceTemplate);
-  }
-
-  FaceTemplate getFaceTemplateInRegion2(Face face, {FaceTemplate? faceTemplate}) {
-    return GetFaceTemplateInRegion2(this, face, faceTemplate: faceTemplate);
-  }
-
-  FaceTemplate getFaceTemplateUsingFeatures(FacialFeatures facialFeatures, {FaceTemplate? faceTemplate}) {
-    return GetFaceTemplateUsingFeatures(this, facialFeatures, faceTemplate: faceTemplate);
-  }
-
-  FaceTemplate getFaceTemplateUsingEyes(Eyes eyeCoords, {FaceTemplate? faceTemplate}) {
-    return GetFaceTemplateUsingEyes(this, eyeCoords, faceTemplate: faceTemplate);
-  }
-
+  /// Detect facial attribute values using facial key points.
+  ///
+  /// - [facialFeatures] the facial key points to work from
+  /// - [attributeName] the attribute to query, such as `Gender` or `Liveness`
+  /// - [maxSizeInBytes] size of the buffer allocated for the result
   String detectFacialAttributeUsingFeatures(FacialFeatures facialFeatures, String attributeName, {int maxSizeInBytes = 256}) {
     return DetectFacialAttributeUsingFeatures(this, facialFeatures, attributeName, maxSizeInBytes: maxSizeInBytes);
   }
 
 }
 
+/// A wrapper object for an FSDK video camera.
 class Camera extends Freeable {
 
   late _NativePointer<Int32> _native;
@@ -1288,11 +1254,11 @@ class Camera extends Freeable {
   }
 
   factory Camera._allocate() {
-    return Camera._fromNativePointer(_AutoNativePointer<Int32>.allocate(sizeOf<Int32>()));
+    return Camera._fromNativePointer(_NativePointer<Int32>.allocate(sizeOf<Int32>()));
   }
 
   factory Camera.fromHandle(int handle) {
-    return Camera._fromNativePointer(_AutoNativePointer<Int32>.allocate(sizeOf<Int32>())..pointer.value = handle);
+    return Camera._fromNativePointer(_NativePointer<Int32>.allocate(sizeOf<Int32>())..pointer.value = handle);
   }
 
   factory Camera.fromPointer(Pointer<Int32> pointer) {
@@ -1306,16 +1272,21 @@ class Camera extends Freeable {
     return OpenIPVideoCamera(compressionType, url, username, password, timeoutSeconds, cameraHandle: cameraHandle);
   }
 
+  /// Close the camera. It becomes invalid.
   void close() {
     CloseVideoCamera(this);
   }
 
+  /// Grab a frame from the camera.
+  ///
+  /// - [image] optional instance to fill and return; reusing one across calls skips an allocation
   Image grabFrame({Image? image}) {
     return GrabFrame(this, image: image);
   }
 
 }
 
+/// A wrapper object for an FSDK tracker.
 class Tracker extends Freeable {
 
   late _NativePointer<Uint32> _native;
@@ -1325,11 +1296,11 @@ class Tracker extends Freeable {
   }
 
   factory Tracker._allocate() {
-    return Tracker._fromNativePointer(_AutoNativePointer<Uint32>.allocate(sizeOf<Uint32>()));
+    return Tracker._fromNativePointer(_NativePointer<Uint32>.allocate(sizeOf<Uint32>()));
   }
 
   factory Tracker.fromHandle(int handle) {
-    return Tracker._fromNativePointer(_AutoNativePointer<Uint32>.allocate(sizeOf<Uint32>())..pointer.value = handle);
+    return Tracker._fromNativePointer(_NativePointer<Uint32>.allocate(sizeOf<Uint32>())..pointer.value = handle);
   }
 
   factory Tracker.fromPointer(Pointer<Uint32> pointer) {
@@ -1343,6 +1314,9 @@ class Tracker extends Freeable {
     return CreateTracker(tracker: tracker);
   }
 
+  /// Free the tracker. It becomes invalid.
+  ///
+  /// - [freePointer] false to release the native tracker but keep the handle cell alive
   @override
   void free({bool freePointer = true}) {
     FreeTracker(this);
@@ -1351,150 +1325,275 @@ class Tracker extends Freeable {
     }
   }
 
+  /// Clear the tracker's memory.
   void clear() {
     ClearTracker(this);
   }
 
+  /// Set a tracker parameter.
+  ///
+  /// - [parameterName] the name of the parameter
+  /// - [parameterValue] the value to set
   void setParameter(String parameterName, String parameterValue) {
     SetTrackerParameter(this, parameterName, parameterValue);
   }
 
+  /// Set several tracker parameters at once.
+  ///
+  /// - [parameters] the parameters to set, as name/value pairs
   void setMultipleParameters(Map<String, dynamic> parameters) {
     SetTrackerMultipleParameters(this, parameters);
   }
 
+  /// Get a tracker parameter.
+  ///
+  /// - [parameterName] the name of the parameter
+  /// - [maxSizeInBytes] size of the buffer allocated for the result
   String getParameter(String parameterName, {int maxSizeInBytes = 256}) {
     return GetTrackerParameter(this, parameterName, maxSizeInBytes: maxSizeInBytes);
   }
 
+  /// Feed a frame to the tracker, returning the ids detected in it.
+  ///
+  /// - [cameraIdx] the camera index the frame was fed with
+  /// - [image] the image to operate on
+  /// - [ids] optional instance to fill and return; reusing one across calls skips an allocation
+  /// - [maxSize] the most results to return
   Int64Buffer feedFrame(int cameraIdx, Image image, {Int64Buffer? ids, int maxSize = 256}) {
     return FeedFrame(this, cameraIdx, image, ids: ids, maxSize: maxSize);
   }
 
-  Eyes getEyes(int cameraIdx, int id, {Eyes? eyes}) {
-    return GetTrackerEyes(this, cameraIdx, id, eyes: eyes);
-  }
-
+  /// Get the facial key points detected for an id.
+  ///
+  /// - [cameraIdx] the camera index the frame was fed with
+  /// - [id] the tracker id identifying a person
+  /// - [facialFeatures] optional instance to fill and return; reusing one across calls skips an allocation
   FacialFeatures getFacialFeatures(int cameraIdx, int id, {FacialFeatures? facialFeatures}) {
     return GetTrackerFacialFeatures(this, cameraIdx, id, facialFeatures: facialFeatures);
   }
 
-  FacePosition getFacePosition(int cameraIdx, int id, {FacePosition? facePosition}) {
-    return GetTrackerFacePosition(this, cameraIdx, id, facePosition: facePosition);
+  /// Get the eye centers detected for an id.
+  ///
+  /// Only the [FacialFeatures.LeftEye] and [FacialFeatures.RightEye] entries are written.
+  ///
+  /// - [cameraIdx] the camera index the frame was fed with
+  /// - [id] the tracker id identifying a person
+  /// - [facialFeatures] optional instance to fill and return; reusing one across calls skips an allocation
+  FacialFeatures getEyes(int cameraIdx, int id, {FacialFeatures? facialFeatures}) {
+    return GetTrackerEyes(this, cameraIdx, id, facialFeatures: facialFeatures);
   }
 
-  Face getFace(int cameraIdx, int id) {
-    return GetTrackerFace(this, cameraIdx, id);
+  /// Get the face detected for an id.
+  ///
+  /// - [cameraIdx] the camera index the frame was fed with
+  /// - [id] the tracker id identifying a person
+  /// - [face] optional instance to fill and return; reusing one across calls skips an allocation
+  Face getFace(int cameraIdx, int id, {Face? face}) {
+    return GetTrackerFace(this, cameraIdx, id, face: face);
   }
 
+  /// Prevent an id from being reassigned or purged.
+  ///
+  /// - [id] the tracker id identifying a person
   void lockID(int id) {
     LockID(this, id);
   }
 
+  /// Release a lock previously taken with `lockID`.
+  ///
+  /// - [id] the tracker id identifying a person
   void unlockID(int id) {
     UnlockID(this, id);
   }
 
+  /// Remove an id from the tracker's memory.
+  ///
+  /// - [id] the tracker id identifying a person
   void purgeID(int id) {
     PurgeID(this, id);
   }
 
+  /// Set the name associated with an id.
+  ///
+  /// - [id] the tracker id identifying a person
+  /// - [name] the name to associate with the id
   void setName(int id, String name) {
     SetName(this, id, name);
   }
 
+  /// Get the name associated with an id.
+  ///
+  /// - [id] the tracker id identifying a person
+  /// - [maxSizeInBytes] size of the buffer allocated for the result
   String getName(int id, {int maxSizeInBytes = 256}) {
     return GetName(this, id, maxSizeInBytes: maxSizeInBytes);
   }
 
+  /// Get every name associated with an id.
+  ///
+  /// - [id] the tracker id identifying a person
+  /// - [maxSizeInBytes] size of the buffer allocated for the result
   String getAllNames(int id, {int maxSizeInBytes = 256}) {
     return GetAllNames(this, id, maxSizeInBytes: maxSizeInBytes);
   }
 
+  /// Get the id this id was reassigned to, if any.
+  ///
+  /// - [id] the tracker id identifying a person
   int getIDReassignment(int id) {
     return GetIDReassignment(this, id);
   }
 
+  /// Get the number of ids considered similar to this one.
+  ///
+  /// - [id] the tracker id identifying a person
   int getSimilarIDCount(int id) {
     return GetSimilarIDCount(this, id);
   }
 
+  /// Get the ids considered similar to this one.
+  ///
+  /// - [id] the tracker id identifying a person
+  /// - [similarIDList] optional instance to fill and return; reusing one across calls skips an allocation
   Int64Buffer getSimilarIDList(int id, {Int64Buffer? similarIDList}) {
     return GetSimilarIDList(this, id, similarIDList: similarIDList);
   }
 
+  /// Save tracker memory to a file.
+  ///
+  /// - [fileName] path to the file
   void saveToFile(String fileName) {
     SaveTrackerMemoryToFile(this, fileName);
   }
 
+  /// Load tracker memory from a file.
+  ///
+  /// - [fileName] path to the file
+  /// - [tracker] optional instance to fill and return; reusing one across calls skips an allocation
   factory Tracker.fromFile(String fileName, {Tracker? tracker}) {
     return LoadTrackerMemoryFromFile(fileName, tracker: tracker);
   }
 
+  /// Get the size in bytes needed to store the tracker's memory.
   int get bufferSize {
     return GetTrackerMemoryBufferSize(this);
   }
 
+  /// Save tracker memory to a buffer.
+  ///
+  /// - [buffer] optional instance to fill and return; reusing one across calls skips an allocation
   DataBuffer saveToBuffer({DataBuffer? buffer}) {
     return SaveTrackerMemoryToBuffer(this, buffer: buffer);
   }
 
+  /// Load tracker memory from a buffer.
+  ///
+  /// - [buffer] the bytes to read from
+  /// - [tracker] optional instance to fill and return; reusing one across calls skips an allocation
   factory Tracker.fromBuffer(DataBuffer buffer, {Tracker? tracker}) {
     return LoadTrackerMemoryFromBuffer(buffer, tracker: tracker);
   }
 
+  /// Get facial attribute values (angles, liveness, ...) for an id.
+  ///
+  /// - [cameraIdx] the camera index the frame was fed with
+  /// - [id] the tracker id identifying a person
+  /// - [attributeName] the attribute to query, such as `Gender` or `Liveness`
+  /// - [maxSizeInBytes] size of the buffer allocated for the result
   String getFacialAttribute(int cameraIdx, int id, String attributeName, {int maxSizeInBytes = 256}) {
     return GetTrackerFacialAttribute(this, cameraIdx, id, attributeName, maxSizeInBytes: maxSizeInBytes);
   }
 
+  /// Get the number of ids held by the tracker.
   int getIDsCount() {
     return GetTrackerIDsCount(this);
   }
 
+  /// Get every id held by the tracker.
   Int64Buffer getAllIDs() {
     return GetTrackerAllIDs(this);
   }
 
+  /// Get the number of face ids stored for an id.
+  ///
+  /// - [id] the tracker id identifying a person
   int getFaceIDsCountForID(int id) {
     return GetTrackerFaceIDsCountForID(this, id);
   }
 
+  /// Get the face ids stored for an id.
+  ///
+  /// - [id] the tracker id identifying a person
   Int64Buffer getFaceIDsForID(int id, {Int64Buffer}) {
     return GetTrackerFaceIDsForID(this, id);
   }
 
+  /// Get the id a face id belongs to.
+  ///
+  /// - [faceID] the face id identifying one stored face of a person
   int getIDByFaceID(int faceID) {
     return GetTrackerIDByFaceID(this, faceID);
   }
 
+  /// Get the face template stored for a face id.
+  ///
+  /// - [faceID] the face id identifying one stored face of a person
+  /// - [faceTemplate] optional instance to fill and return; reusing one across calls skips an allocation
   FaceTemplate getFaceTemplate(int faceID, {FaceTemplate? faceTemplate}) {
     return GetTrackerFaceTemplate(this, faceID, faceTemplate: faceTemplate);
   }
 
+  /// Get the face image stored for a face id.
+  ///
+  /// - [faceID] the face id identifying one stored face of a person
+  /// - [image] optional instance to fill and return; reusing one across calls skips an allocation
   Image getFaceImage(int faceID, {Image? image}) {
     return GetTrackerFaceImage(this, faceID, image: image);
   }
 
+  /// Store a face image for a face id.
+  ///
+  /// - [faceID] the face id identifying one stored face of a person
+  /// - [faceImage] the image to store
   void setFaceImage(int faceID, Image faceImage) {
     SetTrackerFaceImage(this, faceID, faceImage);
   }
 
+  /// Delete the face image stored for a face id.
+  ///
+  /// - [faceID] the face id identifying one stored face of a person
   void deleteFaceImage(int faceID) {
     DeleteTrackerFaceImage(this, faceID);
   }
 
+  /// Create a new id from a face template.
+  ///
+  /// - [faceTemplate] the face template to use
   TrackerCreateIDResult createID(FaceTemplate faceTemplate) {
     return TrackerCreateID(this, faceTemplate);
   }
 
+  /// Add a face template to an existing id.
+  ///
+  /// - [id] the tracker id identifying a person
+  /// - [faceTemplate] the face template to use
   int addFaceTemplate(int id, FaceTemplate faceTemplate) {
     return AddTrackerFaceTemplate(this, id, faceTemplate);
   }
 
+  /// Delete a face from the tracker's memory.
+  ///
+  /// - [faceID] the face id identifying one stored face of a person
   void deleteFace(int faceID) {
     DeleteTrackerFace(this, faceID);
   }
 
+  /// Match a template against the tracker's memory.
+  ///
+  /// - [faceTemplate] the face template to use
+  /// - [threshold] the lowest similarity worth returning
+  /// - [idSimilarities] optional instance to fill and return; reusing one across calls skips an allocation
+  /// - [maxCount] the most results to return
   IDSimilarities matchFaces(FaceTemplate faceTemplate, double threshold, {IDSimilarities? idSimilarities, int maxCount = 1024}) {
     return TrackerMatchFaces(this, faceTemplate, threshold, idSimilarities: idSimilarities, maxCount: maxCount);
   }
@@ -1530,6 +1629,9 @@ class _ActivateLibraryWrapper {
   }
 }
 
+/// Activate the library with a license key. Must be called before any other function.
+///
+/// - [licenseKey] the license key to activate with
 final ActivateLibrary = _ActivateLibraryWrapper();
 
 class _GetHardware_IDWrapper {
@@ -1551,6 +1653,9 @@ class _GetHardware_IDWrapper {
   }
 }
 
+/// Get this device's hardware id, used when requesting a license.
+///
+/// - [maxSize] the most results to return
 final GetHardware_ID = _GetHardware_IDWrapper();
 
 class _GetLicenseInfoWrapper {
@@ -1572,7 +1677,32 @@ class _GetLicenseInfoWrapper {
   }
 }
 
+/// Get information about the active license.
+///
+/// - [maxSize] the most results to return
 final GetLicenseInfo = _GetLicenseInfoWrapper();
+
+class _GetVersionInfoWrapper {
+
+  late int Function(Pointer<Pointer<Utf8>>) _func;
+
+  _GetVersionInfoWrapper() {
+    _func = _nativeLib.lookup<NativeFunction<Int32 Function(Pointer<Pointer<Utf8>>)>>('FSDK_GetVersionInfo').asFunction();
+  }
+
+  String call() {
+    final var1 = malloc.allocate<Pointer<Utf8>>(1);
+    try {
+      _checkErrorCode(_func(var1), 'GetVersionInfo');
+      return var1.value.toDartString();
+    } finally {
+      malloc.free(var1);
+    }
+  }
+}
+
+/// Get the FaceSDK version string.
+final GetVersionInfo = _GetVersionInfoWrapper();
 
 class _SetNumThreadsWrapper {
 
@@ -1587,6 +1717,9 @@ class _SetNumThreadsWrapper {
   }
 }
 
+/// Set the maximum number of threads the SDK may use.
+///
+/// - [num] the number of threads
 final SetNumThreads = _SetNumThreadsWrapper();
 
 class _GetNumThreadsWrapper {
@@ -1608,21 +1741,30 @@ class _GetNumThreadsWrapper {
   }
 }
 
+/// Get the maximum number of threads the SDK may use.
 final GetNumThreads = _GetNumThreadsWrapper();
 
 class _InitializeWrapper {
 
-  late int Function() _func;
+  late int Function(Pointer<Utf8>) _func;
 
   _InitializeWrapper() {
-    _func = _nativeLib.lookup<NativeFunction<Int32 Function()>>('FSDK_Initialize').asFunction();
+    _func = _nativeLib.lookup<NativeFunction<Int32 Function(Pointer<Utf8>)>>('FSDK_Initialize').asFunction();
   }
 
-  void call() {
-    _checkErrorCode(_func(), 'Initialize');
+  void call({String? dataFilesPath}) {
+    final var1 = dataFilesPath == null ? nullptr : dataFilesPath.toNativeUtf8();
+    try {
+      _checkErrorCode(_func(var1.cast()), 'Initialize');
+    } finally {
+      if (var1 != nullptr) {
+        malloc.free(var1);
+      }
+    }
   }
 }
 
+/// Initialize the library. Call after `ActivateLibrary`.
 final Initialize = _InitializeWrapper();
 
 class _InitializeLibrary {
@@ -1649,6 +1791,7 @@ class _FinalizeWrapper {
   }
 }
 
+/// Finalize the library and release the resources it holds.
 final Finalize = _FinalizeWrapper();
 
 class _CreateEmptyImageWrapper {
@@ -1666,6 +1809,9 @@ class _CreateEmptyImageWrapper {
   }
 }
 
+/// Create a new empty image.
+///
+/// - [image] optional instance to fill and return; reusing one across calls skips an allocation
 final CreateEmptyImage = _CreateEmptyImageWrapper();
 
 class _FreeImageWrapper {
@@ -1681,6 +1827,9 @@ class _FreeImageWrapper {
   }
 }
 
+/// Free the internal image buffer. The image becomes invalid.
+///
+/// - [image] the image to release
 final FreeImage = _FreeImageWrapper();
 
 class _LoadImageFromFileWrapper {
@@ -1703,6 +1852,10 @@ class _LoadImageFromFileWrapper {
   }
 }
 
+/// Load an image from a file.
+///
+/// - [fileName] path to the file
+/// - [image] optional instance to fill and return; reusing one across calls skips an allocation
 final LoadImageFromFile = _LoadImageFromFileWrapper();
 
 class _LoadImageFromFileWithAlphaWrapper {
@@ -1725,6 +1878,10 @@ class _LoadImageFromFileWithAlphaWrapper {
   }
 }
 
+/// Load an image from a file, preserving its alpha channel.
+///
+/// - [fileName] path to the file
+/// - [image] optional instance to fill and return; reusing one across calls skips an allocation
 final LoadImageFromFileWithAlpha = _LoadImageFromFileWithAlphaWrapper();
 
 class _SaveImageToFileWrapper {
@@ -1745,6 +1902,10 @@ class _SaveImageToFileWrapper {
   }
 }
 
+/// Save the image into a file.
+///
+/// - [image] the image to operate on
+/// - [fileName] path to the file
 final SaveImageToFile = _SaveImageToFileWrapper();
 
 class _SetJpegCompressionQualityWrapper {
@@ -1760,6 +1921,9 @@ class _SetJpegCompressionQualityWrapper {
   }
 }
 
+/// Set the JPEG quality used when saving images.
+///
+/// - [quality] JPEG quality, where higher values keep more detail
 final SetJpegCompressionQuality = _SetJpegCompressionQualityWrapper();
 
 class _GetImageWidthWrapper {
@@ -1781,6 +1945,9 @@ class _GetImageWidthWrapper {
   }
 }
 
+/// Get image width.
+///
+/// - [image] the image to operate on
 final GetImageWidth = _GetImageWidthWrapper();
 
 class _GetImageHeightWrapper {
@@ -1802,7 +1969,56 @@ class _GetImageHeightWrapper {
   }
 }
 
+/// Get image height.
+///
+/// - [image] the image to operate on
 final GetImageHeight = _GetImageHeightWrapper();
+
+/// A view over an image's own pixel buffer.
+///
+/// The memory belongs to the image, so the view stays valid only while the image
+/// is left untouched. Copy out of it before modifying or freeing the image.
+class ImageData {
+
+  final Pointer<Uint8> pointer;
+  final int width;
+  final int height;
+  final int scanLine;
+  final ImageMode imageMode;
+
+  ImageData(this.pointer, this.width, this.height, this.scanLine, this.imageMode);
+
+  /// The pixel bytes, as a view over the image's buffer rather than a copy.
+  Uint8List asUint8List() => pointer.asTypedList(scanLine * height);
+
+}
+
+class _GetImageDataWrapper {
+
+  late int Function(int, Pointer<Pointer<Uint8>>, Pointer<Int32>, Pointer<Int32>, Pointer<Int32>, Pointer<Int32>) _func;
+
+  _GetImageDataWrapper() {
+    _func = _nativeLib.lookup<NativeFunction<Int32 Function(Uint32, Pointer<Pointer<Uint8>>, Pointer<Int32>, Pointer<Int32>, Pointer<Int32>, Pointer<Int32>)>>('FSDK_GetImageData').asFunction();
+  }
+
+  ImageData call(Image image) {
+    final var1 = malloc.allocate<Pointer<Uint8>>(sizeOf<Pointer<Uint8>>());
+    final var2 = malloc.allocate<Int32>(sizeOf<Int32>() * 4);
+    try {
+      _checkErrorCode(_func(image.handle, var1, var2, var2 + 1, var2 + 2, var2 + 3), 'GetImageData');
+      return ImageData(var1.value, var2[0], var2[1], var2[2], ImageMode.values[var2[3]]);
+    } finally {
+      malloc.free(var2);
+      malloc.free(var1);
+    }
+  }
+}
+
+/// Get a view over the image's own pixel buffer, along with its dimensions and
+/// pixel format. The buffer is not copied and belongs to the image.
+///
+/// - [image] the image to read from
+final GetImageData = _GetImageDataWrapper();
 
 class _LoadImageFromBufferWrapper {
 
@@ -1819,6 +2035,14 @@ class _LoadImageFromBufferWrapper {
   }
 }
 
+/// Load an image from a raw pixel buffer.
+///
+/// - [buffer] the raw pixel bytes to load
+/// - [width] width in pixels
+/// - [height] height in pixels
+/// - [scanLine] number of bytes per row in [buffer]
+/// - [imageMode] the pixel format of [buffer]
+/// - [image] optional instance to fill and return; reusing one across calls skips an allocation
 final LoadImageFromBuffer = _LoadImageFromBufferWrapper();
 
 class _GetImageBufferSizeWrapper {
@@ -1840,6 +2064,10 @@ class _GetImageBufferSizeWrapper {
   }
 }
 
+/// Get the size in bytes of a buffer encoding the image in the given format.
+///
+/// - [image] the image to operate on
+/// - [imageMode] the pixel format to measure for
 final GetImageBufferSize = _GetImageBufferSizeWrapper();
 
 class _SaveImageToBufferWrapper {
@@ -1857,6 +2085,11 @@ class _SaveImageToBufferWrapper {
   }
 }
 
+/// Save the image into a byte buffer.
+///
+/// - [image] the image to operate on
+/// - [imageMode] the pixel format to encode with
+/// - [buffer] optional instance to fill and return; reusing one across calls skips an allocation
 final SaveImageToBuffer = _SaveImageToBufferWrapper();
 
 class _LoadImageFromJpegBufferWrapper {
@@ -1864,7 +2097,7 @@ class _LoadImageFromJpegBufferWrapper {
   late int Function(Pointer<Uint32>, Pointer<Uint8>, int) _func;
 
   _LoadImageFromJpegBufferWrapper() {
-    _func = _nativeLib.lookup<NativeFunction<Int32 Function(Pointer<Uint32>, Pointer<Uint8>, Int32)>>('FSDK_LoadImageFromJpegBuffer').asFunction();
+    _func = _nativeLib.lookup<NativeFunction<Int32 Function(Pointer<Uint32>, Pointer<Uint8>, Uint32)>>('FSDK_LoadImageFromJpegBuffer').asFunction();
   }
 
   Image call(DataBuffer buffer, {Image? image}) {
@@ -1874,6 +2107,10 @@ class _LoadImageFromJpegBufferWrapper {
   }
 }
 
+/// Load an image from a JPEG encoded buffer.
+///
+/// - [buffer] the JPEG encoded bytes to load
+/// - [image] optional instance to fill and return; reusing one across calls skips an allocation
 final LoadImageFromJpegBuffer = _LoadImageFromJpegBufferWrapper();
 
 class _LoadImageFromPngBufferWrapper {
@@ -1881,7 +2118,7 @@ class _LoadImageFromPngBufferWrapper {
   late int Function(Pointer<Uint32>, Pointer<Uint8>, int) _func;
 
   _LoadImageFromPngBufferWrapper() {
-    _func = _nativeLib.lookup<NativeFunction<Int32 Function(Pointer<Uint32>, Pointer<Uint8>, Int32)>>('FSDK_LoadImageFromPngBuffer').asFunction();
+    _func = _nativeLib.lookup<NativeFunction<Int32 Function(Pointer<Uint32>, Pointer<Uint8>, Uint32)>>('FSDK_LoadImageFromPngBuffer').asFunction();
   }
 
   Image call(DataBuffer buffer, {Image? image}) {
@@ -1891,6 +2128,10 @@ class _LoadImageFromPngBufferWrapper {
   }
 }
 
+/// Load an image from a PNG encoded buffer.
+///
+/// - [buffer] the PNG encoded bytes to load
+/// - [image] optional instance to fill and return; reusing one across calls skips an allocation
 final LoadImageFromPngBuffer = _LoadImageFromPngBufferWrapper();
 
 class _LoadImageFromPngBufferWithAlphaWrapper {
@@ -1898,7 +2139,7 @@ class _LoadImageFromPngBufferWithAlphaWrapper {
   late int Function(Pointer<Uint32>, Pointer<Uint8>, int) _func;
 
   _LoadImageFromPngBufferWithAlphaWrapper() {
-    _func = _nativeLib.lookup<NativeFunction<Int32 Function(Pointer<Uint32>, Pointer<Uint8>, Int32)>>('FSDK_LoadImageFromPngBufferWithAlpha').asFunction();
+    _func = _nativeLib.lookup<NativeFunction<Int32 Function(Pointer<Uint32>, Pointer<Uint8>, Uint32)>>('FSDK_LoadImageFromPngBufferWithAlpha').asFunction();
   }
 
   Image call(DataBuffer buffer, {Image? image}) {
@@ -1908,133 +2149,61 @@ class _LoadImageFromPngBufferWithAlphaWrapper {
   }
 }
 
+/// Load an image from a PNG encoded buffer, preserving its alpha channel.
+///
+/// - [buffer] the PNG encoded bytes to load
+/// - [image] optional instance to fill and return; reusing one across calls skips an allocation
 final LoadImageFromPngBufferWithAlpha = _LoadImageFromPngBufferWithAlphaWrapper();
 
 class _DetectFaceWrapper {
 
-  late int Function(int, Pointer<_FacePosition>) _func;
-
-  _DetectFaceWrapper() {
-    _func = _nativeLib.lookup<NativeFunction<Int32 Function(Uint32, Pointer<_FacePosition>)>>('FSDK_DetectFace').asFunction();
-  }
-
-  FacePosition call(Image image, {FacePosition? facePosition}) {
-    facePosition ??= FacePosition._allocate();
-    _checkErrorCode(_func(image.handle, facePosition.pointer), 'DetectFace');
-    return facePosition;
-  }
-}
-
-final DetectFace = _DetectFaceWrapper();
-
-class _DetectMultipleFacesWrapper {
-
-  late int Function(int, Pointer<Int32>, Pointer<_FacePosition>, int) _func;
-
-  _DetectMultipleFacesWrapper() {
-    _func = _nativeLib.lookup<NativeFunction<Int32 Function(Uint32, Pointer<Int32>, Pointer<_FacePosition>, Int32)>>('FSDK_DetectMultipleFaces').asFunction();
-  }
-
-  FacePositions call(Image image, {FacePositions? faces, int maxSize = 256}) {
-    faces ??= FacePositions._allocate(maxSize);
-    _checkErrorCode(_func(image.handle, faces._lengthPointer, faces.pointer, sizeOf<Int32>() * faces.capacity), 'DetectMultipleFaces');
-    return faces;
-  }
-}
-
-final DetectMultipleFaces = _DetectMultipleFacesWrapper();
-
-class _DetectMultipleFaces2Wrapper {
-
-  late int Function(int, Pointer<Int32>, Pointer<_Face>, int) _func;
-
-  _DetectMultipleFaces2Wrapper() {
-    _func = _nativeLib.lookup<NativeFunction<Int32 Function(Uint32, Pointer<Int32>, Pointer<_Face>, Int32)>>('FSDK_DetectMultipleFaces2').asFunction();
-  }
-
-  Faces call(Image image, {Faces? faces, int maxSize = 256}) {
-    faces ??= Faces._allocate(maxSize);
-    _checkErrorCode(_func(image.handle, faces._lengthPointer, faces.pointer, sizeOf<Int32>() * faces.capacity), 'DetectMultipleFaces2');
-    return faces;
-  }
-}
-
-final DetectMultipleFaces2 = _DetectMultipleFaces2Wrapper();
-
-class _DetectFace2Wrapper {
-
   late int Function(int, Pointer<_Face>) _func;
 
-  _DetectFace2Wrapper() {
-    _func = _nativeLib.lookup<NativeFunction<Int32 Function(Uint32, Pointer<_Face>)>>('FSDK_DetectFace2').asFunction();
+  _DetectFaceWrapper() {
+    _func = _nativeLib.lookup<NativeFunction<Int32 Function(Uint32, Pointer<_Face>)>>('FSDK_DetectFace').asFunction();
   }
 
   Face call(Image image, {Face? face}) {
     face ??= Face._allocate();
-    _checkErrorCode(_func(image.handle, face.pointer), 'DetectFace2');
+    _checkErrorCode(_func(image.handle, face.pointer), 'DetectFace');
     return face;
   }
 }
 
-final DetectFace2 = _DetectFace2Wrapper();
+/// Detect a single face. If several are present, returns the highest scoring one.
+///
+/// - [image] the image to operate on
+/// - [face] optional instance to fill and return; reusing one across calls skips an allocation
+final DetectFace = _DetectFaceWrapper();
 
-class _SetFaceDetectionParametersWrapper {
+class _DetectMultipleFacesWrapper {
 
-  late int Function(int, int, int) _func;
+  late int Function(int, Pointer<Int32>, Pointer<_Face>, int) _func;
 
-  _SetFaceDetectionParametersWrapper() {
-    _func = _nativeLib.lookup<NativeFunction<Int32 Function(Uint8, Uint8, Int32)>>('FSDK_SetFaceDetectionParameters').asFunction();
+  _DetectMultipleFacesWrapper() {
+    _func = _nativeLib.lookup<NativeFunction<Int32 Function(Uint32, Pointer<Int32>, Pointer<_Face>, Int32)>>('FSDK_DetectMultipleFaces').asFunction();
   }
 
-  void call(bool handleArbitraryRotations, bool determineFaceRotationAngle, int internalResizeWidth) {
-    _checkErrorCode(_func(handleArbitraryRotations ? 1 : 0, determineFaceRotationAngle ? 1 : 0, internalResizeWidth), 'SetFaceDetectionParameters');
-  }
-}
-
-final SetFaceDetectionParameters = _SetFaceDetectionParametersWrapper();
-
-class _SetFaceDetectionThresholdWrapper {
-
-  late int Function(int) _func;
-
-  _SetFaceDetectionThresholdWrapper() {
-    _func = _nativeLib.lookup<NativeFunction<Int32 Function(Int32)>>('FSDK_SetFaceDetectionThreshold').asFunction();
-  }
-
-  void call(int threshold) {
-    _checkErrorCode(_func(threshold), 'SetFaceDetectionThreshold');
+  Faces call(Image image, {Faces? faces, int maxSize = 256}) {
+    faces ??= Faces._allocate(maxSize);
+    _checkErrorCode(_func(image.handle, faces._lengthPointer, faces.pointer, faces.capacity), 'DetectMultipleFaces');
+    return faces;
   }
 }
 
-final SetFaceDetectionThreshold = _SetFaceDetectionThresholdWrapper();
-
-class _GetDetectedFaceConfidenceWrapper {
-
-  late int Function(Pointer<Int32>) _func;
-
-  _GetDetectedFaceConfidenceWrapper() {
-    _func = _nativeLib.lookup<NativeFunction<Int32 Function(Pointer<Int32>)>>('FSDK_GetDetectedFaceConfidence').asFunction();
-  }
-
-  int call() {
-    final var1 = malloc.allocate<Int32>(sizeOf<Int32>() * 1);
-    try {
-      _checkErrorCode(_func(var1), 'GetDetectedFaceConfidence');
-      return var1.value;
-    } finally {
-      malloc.free(var1);
-    }
-  }
-}
-
-final GetDetectedFaceConfidence = _GetDetectedFaceConfidenceWrapper();
+/// Detect multiple faces, sorted by detection score descending.
+///
+/// - [image] the image to operate on
+/// - [faces] optional instance to fill and return; reusing one across calls skips an allocation
+/// - [maxSize] the most results to return
+final DetectMultipleFaces = _DetectMultipleFacesWrapper();
 
 class _DetectFacialFeaturesWrapper {
 
-  late int Function(int, Pointer<Point>) _func;
+  late int Function(int, Pointer<PointF>) _func;
 
   _DetectFacialFeaturesWrapper() {
-    _func = _nativeLib.lookup<NativeFunction<Int32 Function(Uint32, Pointer<Point>)>>('FSDK_DetectFacialFeatures').asFunction();
+    _func = _nativeLib.lookup<NativeFunction<Int32 Function(Uint32, Pointer<PointF>)>>('FSDK_DetectFacialFeatures').asFunction();
   }
 
   FacialFeatures call(Image image, {FacialFeatures? facialFeatures}) {
@@ -2044,58 +2213,33 @@ class _DetectFacialFeaturesWrapper {
   }
 }
 
+/// Detect the facial key points of a single face.
+///
+/// - [image] the image to operate on
+/// - [facialFeatures] optional instance to fill and return; reusing one across calls skips an allocation
 final DetectFacialFeatures = _DetectFacialFeaturesWrapper();
 
 class _DetectFacialFeaturesInRegionWrapper {
 
-  late int Function(int, Pointer<_FacePosition>, Pointer<Point>) _func;
+  late int Function(int, Pointer<_Face>, Pointer<PointF>) _func;
 
   _DetectFacialFeaturesInRegionWrapper() {
-    _func = _nativeLib.lookup<NativeFunction<Int32 Function(Uint32, Pointer<_FacePosition>, Pointer<Point>)>>('FSDK_DetectFacialFeaturesInRegion').asFunction();
+    _func = _nativeLib.lookup<NativeFunction<Int32 Function(Uint32, Pointer<_Face>, Pointer<PointF>)>>('FSDK_DetectFacialFeaturesInRegion').asFunction();
   }
 
-  FacialFeatures call(Image image, FacePosition facePosition, {FacialFeatures? facialFeatures}) {
+  FacialFeatures call(Image image, Face face, {FacialFeatures? facialFeatures}) {
     facialFeatures ??= FacialFeatures._allocate();
-    _checkErrorCode(_func(image.handle, facePosition.pointer, facialFeatures.pointer), 'DetectFacialFeaturesInRegion');
+    _checkErrorCode(_func(image.handle, face.pointer, facialFeatures.pointer), 'DetectFacialFeaturesInRegion');
     return facialFeatures;
   }
 }
 
+/// Detect the facial key points of a given face.
+///
+/// - [image] the image to operate on
+/// - [face] the face region to work within
+/// - [facialFeatures] optional instance to fill and return; reusing one across calls skips an allocation
 final DetectFacialFeaturesInRegion = _DetectFacialFeaturesInRegionWrapper();
-
-class _DetectEyesWrapper {
-
-  late int Function(int, Pointer<Point>) _func;
-
-  _DetectEyesWrapper() {
-    _func = _nativeLib.lookup<NativeFunction<Int32 Function(Uint32, Pointer<Point>)>>('FSDK_DetectEyes').asFunction();
-  }
-
-  Eyes call(Image image, {Eyes? eyes}) {
-    eyes ??= Eyes._allocate();
-    _checkErrorCode(_func(image.handle, eyes.pointer), 'DetectEyes');
-    return eyes;
-  }
-}
-
-final DetectEyes = _DetectEyesWrapper();
-
-class _DetectEyesInRegionWrapper {
-
-  late int Function(int, Pointer<_FacePosition>, Pointer<Point>) _func;
-
-  _DetectEyesInRegionWrapper() {
-    _func = _nativeLib.lookup<NativeFunction<Int32 Function(Uint32, Pointer<_FacePosition>, Pointer<Point>)>>('FSDK_DetectEyesInRegion').asFunction();
-  }
-
-  Eyes call(Image image, FacePosition facePosition, {Eyes? eyes}) {
-    eyes ??= Eyes._allocate();
-    _checkErrorCode(_func(image.handle, facePosition.pointer, eyes.pointer), 'DetectEyesInRegion');
-    return eyes;
-  }
-}
-
-final DetectEyesInRegion = _DetectEyesInRegionWrapper();
 
 class _CopyImageWrapper {
 
@@ -2112,6 +2256,9 @@ class _CopyImageWrapper {
   }
 }
 
+/// Create a copy of the image.
+///
+/// - [sourceImage] the image to read from
 final CopyImage = _CopyImageWrapper();
 
 class _ResizeImageWrapper {
@@ -2129,6 +2276,10 @@ class _ResizeImageWrapper {
   }
 }
 
+/// Create a new image scaled by `ratio`.
+///
+/// - [sourceImage] the image to read from
+/// - [ratio] scale factor, where 1.0 keeps the original size
 final ResizeImage = _ResizeImageWrapper();
 
 class _RotateImage90Wrapper {
@@ -2146,6 +2297,11 @@ class _RotateImage90Wrapper {
   }
 }
 
+/// Create a new image rotated by 90 * `multiplier` degrees. Negative values rotate
+/// counterclockwise.
+///
+/// - [sourceImage] the image to read from
+/// - [multiplier] number of 90 degree steps; negative values rotate counterclockwise
 final RotateImage90 = _RotateImage90Wrapper();
 
 class _RotateImageWrapper {
@@ -2163,6 +2319,10 @@ class _RotateImageWrapper {
   }
 }
 
+/// Create a new image rotated `angle` degrees around the center.
+///
+/// - [sourceImage] the image to read from
+/// - [angle] rotation in degrees
 final RotateImage = _RotateImageWrapper();
 
 class _RotateImageCenterWrapper {
@@ -2180,6 +2340,12 @@ class _RotateImageCenterWrapper {
   }
 }
 
+/// Create a new image rotated `angle` degrees around (`x`, `y`).
+///
+/// - [sourceImage] the image to read from
+/// - [angle] rotation in degrees
+/// - [xCenter] x coordinate to rotate around
+/// - [yCenter] y coordinate to rotate around
 final RotateImageCenter = _RotateImageCenterWrapper();
 
 class _CopyRectWrapper {
@@ -2197,6 +2363,13 @@ class _CopyRectWrapper {
   }
 }
 
+/// Copy the axis-aligned rectangle bounded by (`x1`, `y1`) and (`x2`, `y2`).
+///
+/// - [sourceImage] the image to read from
+/// - [x1] left edge of the rectangle
+/// - [y1] top edge of the rectangle
+/// - [x2] right edge of the rectangle
+/// - [y2] bottom edge of the rectangle
 final CopyRect = _CopyRectWrapper();
 
 class _CopyRectReplicateBorderWrapper {
@@ -2214,6 +2387,13 @@ class _CopyRectReplicateBorderWrapper {
   }
 }
 
+/// As `CopyRect`, but parts outside the image repeat the border pixels.
+///
+/// - [sourceImage] the image to read from
+/// - [x1] left edge of the rectangle
+/// - [y1] top edge of the rectangle
+/// - [x2] right edge of the rectangle
+/// - [y2] bottom edge of the rectangle
 final CopyRectReplicateBorder = _CopyRectReplicateBorderWrapper();
 
 class _MirrorImageWrapper {
@@ -2229,14 +2409,18 @@ class _MirrorImageWrapper {
   }
 }
 
+/// Mirror the image around the vertical or horizontal axis.
+///
+/// - [image] the image to mirror in place
+/// - [useVerticalMirroringInsteadOfHorizontal] true to mirror around the vertical axis, false for the horizontal one
 final MirrorImage = _MirrorImageWrapper();
 
 class _ExtractFaceImageWrapper {
 
-  late int Function(int, Pointer<Point>, int, int, Pointer<Uint32>, Pointer<Point>) _func;
+  late int Function(int, Pointer<PointF>, int, int, Pointer<Uint32>, Pointer<PointF>) _func;
 
   _ExtractFaceImageWrapper() {
-    _func = _nativeLib.lookup<NativeFunction<Int32 Function(Uint32, Pointer<Point>, Int32, Int32, Pointer<Uint32>, Pointer<Point>)>>('FSDK_ExtractFaceImage').asFunction();
+    _func = _nativeLib.lookup<NativeFunction<Int32 Function(Uint32, Pointer<PointF>, Int32, Int32, Pointer<Uint32>, Pointer<PointF>)>>('FSDK_ExtractFaceImage').asFunction();
   }
 
   ExtractedFace call(Image image, FacialFeatures facialFeatures, int width, int height, {Image? extractedFaceImage, FacialFeatures? resizedFeatures}) {
@@ -2247,6 +2431,14 @@ class _ExtractFaceImageWrapper {
   }
 }
 
+/// Extract the part of the image containing the face, resized to `width` x `height`.
+///
+/// - [image] the image to operate on
+/// - [facialFeatures] the key points locating the face in [image]
+/// - [width] width of the extracted image
+/// - [height] height of the extracted image
+/// - [extractedFaceImage] optional instance to fill and return; reusing one across calls skips an allocation
+/// - [resizedFeatures] optional instance to fill and return; reusing one across calls skips an allocation
 final ExtractFaceImage = _ExtractFaceImageWrapper();
 
 class _GetFaceTemplateWrapper {
@@ -2264,48 +2456,18 @@ class _GetFaceTemplateWrapper {
   }
 }
 
+/// Get the face template of a single face.
+///
+/// - [image] the image to operate on
+/// - [faceTemplate] optional instance to fill and return; reusing one across calls skips an allocation
 final GetFaceTemplate = _GetFaceTemplateWrapper();
-
-class _GetFaceTemplate2Wrapper {
-
-  late int Function(int, Pointer<Uint8>) _func;
-
-  _GetFaceTemplate2Wrapper() {
-    _func = _nativeLib.lookup<NativeFunction<Int32 Function(Uint32, Pointer<Uint8>)>>('FSDK_GetFaceTemplate2').asFunction();
-  }
-
-  FaceTemplate call(Image image, {FaceTemplate? faceTemplate}) {
-    faceTemplate ??= FaceTemplate._allocate();
-    _checkErrorCode(_func(image.handle, faceTemplate.pointer), 'GetFaceTemplate2');
-    return faceTemplate;
-  }
-}
-
-final GetFaceTemplate2 = _GetFaceTemplate2Wrapper();
 
 class _GetFaceTemplateInRegionWrapper {
 
-  late int Function(int, Pointer<_FacePosition>, Pointer<Uint8>) _func;
-
-  _GetFaceTemplateInRegionWrapper() {
-    _func = _nativeLib.lookup<NativeFunction<Int32 Function(Uint32, Pointer<_FacePosition>, Pointer<Uint8>)>>('FSDK_GetFaceTemplateInRegion').asFunction();
-  }
-
-  FaceTemplate call(Image image, FacePosition facePosition, {FaceTemplate? faceTemplate}) {
-    faceTemplate ??= FaceTemplate._allocate();
-    _checkErrorCode(_func(image.handle, facePosition.pointer, faceTemplate.pointer), 'GetFaceTemplateInRegion');
-    return faceTemplate;
-  }
-}
-
-final GetFaceTemplateInRegion = _GetFaceTemplateInRegionWrapper();
-
-class _GetFaceTemplateInRegion2Wrapper {
-
   late int Function(int, Pointer<_Face>, Pointer<Uint8>) _func;
 
-  _GetFaceTemplateInRegion2Wrapper() {
-    _func = _nativeLib.lookup<NativeFunction<Int32 Function(Uint32, Pointer<_Face>, Pointer<Uint8>)>>('FSDK_GetFaceTemplateInRegion2').asFunction();
+  _GetFaceTemplateInRegionWrapper() {
+    _func = _nativeLib.lookup<NativeFunction<Int32 Function(Uint32, Pointer<_Face>, Pointer<Uint8>)>>('FSDK_GetFaceTemplateInRegion').asFunction();
   }
 
   FaceTemplate call(Image image, Face face, {FaceTemplate? faceTemplate}) {
@@ -2315,41 +2477,12 @@ class _GetFaceTemplateInRegion2Wrapper {
   }
 }
 
-final GetFaceTemplateInRegion2 = _GetFaceTemplateInRegion2Wrapper();
-
-class _GetFaceTemplateUsingFeaturesWrapper {
-
-  late int Function(int, Pointer<Point>, Pointer<Uint8>) _func;
-
-  _GetFaceTemplateUsingFeaturesWrapper() {
-    _func = _nativeLib.lookup<NativeFunction<Int32 Function(Uint32, Pointer<Point>, Pointer<Uint8>)>>('FSDK_GetFaceTemplateUsingFeatures').asFunction();
-  }
-
-  FaceTemplate call(Image image, FacialFeatures facialFeatures, {FaceTemplate? faceTemplate}) {
-    faceTemplate ??= FaceTemplate._allocate();
-    _checkErrorCode(_func(image.handle, facialFeatures.pointer, faceTemplate.pointer), 'GetFaceTemplateUsingFeatures');
-    return faceTemplate;
-  }
-}
-
-final GetFaceTemplateUsingFeatures = _GetFaceTemplateUsingFeaturesWrapper();
-
-class _GetFaceTemplateUsingEyesWrapper {
-
-  late int Function(int, Pointer<Point>, Pointer<Uint8>) _func;
-
-  _GetFaceTemplateUsingEyesWrapper() {
-    _func = _nativeLib.lookup<NativeFunction<Int32 Function(Uint32, Pointer<Point>, Pointer<Uint8>)>>('FSDK_GetFaceTemplateUsingEyes').asFunction();
-  }
-
-  FaceTemplate call(Image image, Eyes eyeCoords, {FaceTemplate? faceTemplate}) {
-    faceTemplate ??= FaceTemplate._allocate();
-    _checkErrorCode(_func(image.handle, eyeCoords.pointer, faceTemplate.pointer), 'GetFaceTemplateUsingEyes');
-    return faceTemplate;
-  }
-}
-
-final GetFaceTemplateUsingEyes = _GetFaceTemplateUsingEyesWrapper();
+/// Get the face template of a given face.
+///
+/// - [image] the image to operate on
+/// - [face] the face region to work within
+/// - [faceTemplate] optional instance to fill and return; reusing one across calls skips an allocation
+final GetFaceTemplateInRegion = _GetFaceTemplateInRegionWrapper();
 
 class _MatchFacesWrapper {
 
@@ -2370,49 +2503,11 @@ class _MatchFacesWrapper {
   }
 }
 
+/// Get the similarity score between two face templates.
+///
+/// - [faceTemplate1] the first template to compare
+/// - [faceTemplate2] the second template to compare
 final MatchFaces = _MatchFacesWrapper();
-
-class _GetMatchingThresholdAtFARWrapper {
-
-  late int Function(double, Pointer<Float>) _func;
-
-  _GetMatchingThresholdAtFARWrapper() {
-    _func = _nativeLib.lookup<NativeFunction<Int32 Function(Float, Pointer<Float>)>>('FSDK_GetMatchingThresholdAtFAR').asFunction();
-  }
-
-  double call(double fARValue) {
-    final var1 = malloc.allocate<Float>(sizeOf<Float>() * 1);
-    try {
-      _checkErrorCode(_func(fARValue, var1), 'GetMatchingThresholdAtFAR');
-      return var1.value;
-    } finally {
-      malloc.free(var1);
-    }
-  }
-}
-
-final GetMatchingThresholdAtFAR = _GetMatchingThresholdAtFARWrapper();
-
-class _GetMatchingThresholdAtFRRWrapper {
-
-  late int Function(double, Pointer<Float>) _func;
-
-  _GetMatchingThresholdAtFRRWrapper() {
-    _func = _nativeLib.lookup<NativeFunction<Int32 Function(Float, Pointer<Float>)>>('FSDK_GetMatchingThresholdAtFRR').asFunction();
-  }
-
-  double call(double fRRValue) {
-    final var1 = malloc.allocate<Float>(sizeOf<Float>() * 1);
-    try {
-      _checkErrorCode(_func(fRRValue, var1), 'GetMatchingThresholdAtFRR');
-      return var1.value;
-    } finally {
-      malloc.free(var1);
-    }
-  }
-}
-
-final GetMatchingThresholdAtFRR = _GetMatchingThresholdAtFRRWrapper();
 
 class _CreateTrackerWrapper {
 
@@ -2429,6 +2524,9 @@ class _CreateTrackerWrapper {
   }
 }
 
+/// Create a new, empty tracker.
+///
+/// - [tracker] optional instance to fill and return; reusing one across calls skips an allocation
 final CreateTracker = _CreateTrackerWrapper();
 
 class _FreeTrackerWrapper {
@@ -2444,6 +2542,9 @@ class _FreeTrackerWrapper {
   }
 }
 
+/// Free the tracker. It becomes invalid.
+///
+/// - [tracker] the tracker to release
 final FreeTracker = _FreeTrackerWrapper();
 
 class _ClearTrackerWrapper {
@@ -2459,6 +2560,9 @@ class _ClearTrackerWrapper {
   }
 }
 
+/// Clear the tracker's memory.
+///
+/// - [tracker] the tracker to operate on
 final ClearTracker = _ClearTrackerWrapper();
 
 class _SetTrackerParameterWrapper {
@@ -2481,6 +2585,11 @@ class _SetTrackerParameterWrapper {
   }
 }
 
+/// Set a tracker parameter.
+///
+/// - [tracker] the tracker to operate on
+/// - [parameterName] the name of the parameter
+/// - [parameterValue] the value to set
 final SetTrackerParameter = _SetTrackerParameterWrapper();
 
 class _SetTrackerMultipleParametersWrapper {
@@ -2503,6 +2612,10 @@ class _SetTrackerMultipleParametersWrapper {
   }
 }
 
+/// Set several tracker parameters at once. Returns the position of the first syntax error.
+///
+/// - [tracker] the tracker to operate on
+/// - [parameters] the parameters to set, as name/value pairs
 final SetTrackerMultipleParameters = _SetTrackerMultipleParametersWrapper();
 
 class _GetTrackerParameterWrapper {
@@ -2510,7 +2623,7 @@ class _GetTrackerParameterWrapper {
   late int Function(int, Pointer<Utf8>, Pointer<Utf8>, int) _func;
 
   _GetTrackerParameterWrapper() {
-    _func = _nativeLib.lookup<NativeFunction<Int32 Function(Uint32, Pointer<Utf8>, Pointer<Utf8>, Int32)>>('FSDK_GetTrackerParameter').asFunction();
+    _func = _nativeLib.lookup<NativeFunction<Int32 Function(Uint32, Pointer<Utf8>, Pointer<Utf8>, Int64)>>('FSDK_GetTrackerParameter').asFunction();
   }
 
   String call(Tracker tracker, String parameterName, {int maxSizeInBytes = 256}) {
@@ -2526,6 +2639,11 @@ class _GetTrackerParameterWrapper {
   }
 }
 
+/// Get a tracker parameter.
+///
+/// - [tracker] the tracker to operate on
+/// - [parameterName] the name of the parameter
+/// - [maxSizeInBytes] size of the buffer allocated for the result
 final GetTrackerParameter = _GetTrackerParameterWrapper();
 
 class _FeedFrameWrapper {
@@ -2543,31 +2661,47 @@ class _FeedFrameWrapper {
   }
 }
 
+/// Feed a frame to the tracker, returning the ids detected in it.
+///
+/// - [tracker] the tracker to operate on
+/// - [cameraIdx] the camera index the frame was fed with
+/// - [image] the image to operate on
+/// - [ids] optional instance to fill and return; reusing one across calls skips an allocation
+/// - [maxSize] the most results to return
 final FeedFrame = _FeedFrameWrapper();
 
 class _GetTrackerEyesWrapper {
 
-  late int Function(int, int, int, Pointer<Point>) _func;
+  late int Function(int, int, int, Pointer<PointF>) _func;
 
   _GetTrackerEyesWrapper() {
-    _func = _nativeLib.lookup<NativeFunction<Int32 Function(Uint32, Int64, Int64, Pointer<Point>)>>('FSDK_GetTrackerEyes').asFunction();
+    _func = _nativeLib.lookup<NativeFunction<Int32 Function(Uint32, Int64, Int64, Pointer<PointF>)>>('FSDK_GetTrackerEyes').asFunction();
   }
 
-  Eyes call(Tracker tracker, int cameraIdx, int id, {Eyes? eyes}) {
-    eyes ??= Eyes._allocate();
-    _checkErrorCode(_func(tracker.handle, cameraIdx, id, eyes.pointer), 'GetTrackerEyes');
-    return eyes;
+  FacialFeatures call(Tracker tracker, int cameraIdx, int id, {FacialFeatures? facialFeatures}) {
+    facialFeatures ??= FacialFeatures._allocate();
+    _checkErrorCode(_func(tracker.handle, cameraIdx, id, facialFeatures.pointer), 'GetTrackerEyes');
+    return facialFeatures;
   }
 }
 
+/// Get the eye centers detected for an id.
+///
+/// Only the [FacialFeatures.LeftEye] and [FacialFeatures.RightEye] entries are
+/// written; the rest of the returned object keeps whatever it held before.
+///
+/// - [tracker] the tracker to operate on
+/// - [cameraIdx] the camera index the frame was fed with
+/// - [id] the tracker id identifying a person
+/// - [facialFeatures] optional instance to fill and return; reusing one across calls skips an allocation
 final GetTrackerEyes = _GetTrackerEyesWrapper();
 
 class _GetTrackerFacialFeaturesWrapper {
 
-  late int Function(int, int, int, Pointer<Point>) _func;
+  late int Function(int, int, int, Pointer<PointF>) _func;
 
   _GetTrackerFacialFeaturesWrapper() {
-    _func = _nativeLib.lookup<NativeFunction<Int32 Function(Uint32, Int64, Int64, Pointer<Point>)>>('FSDK_GetTrackerFacialFeatures').asFunction();
+    _func = _nativeLib.lookup<NativeFunction<Int32 Function(Uint32, Int64, Int64, Pointer<PointF>)>>('FSDK_GetTrackerFacialFeatures').asFunction();
   }
 
   FacialFeatures call(Tracker tracker, int cameraIdx, int id, {FacialFeatures? facialFeatures}) {
@@ -2577,24 +2711,13 @@ class _GetTrackerFacialFeaturesWrapper {
   }
 }
 
+/// Get the facial key points detected for an id.
+///
+/// - [tracker] the tracker to operate on
+/// - [cameraIdx] the camera index the frame was fed with
+/// - [id] the tracker id identifying a person
+/// - [facialFeatures] optional instance to fill and return; reusing one across calls skips an allocation
 final GetTrackerFacialFeatures = _GetTrackerFacialFeaturesWrapper();
-
-class _GetTrackerFacePositionWrapper {
-
-  late int Function(int, int, int, Pointer<_FacePosition>) _func;
-
-  _GetTrackerFacePositionWrapper() {
-    _func = _nativeLib.lookup<NativeFunction<Int32 Function(Uint32, Int64, Int64, Pointer<_FacePosition>)>>('FSDK_GetTrackerFacePosition').asFunction();
-  }
-
-  FacePosition call(Tracker tracker, int cameraIdx, int id, {FacePosition? facePosition}) {
-    facePosition ??= FacePosition._allocate();
-    _checkErrorCode(_func(tracker.handle, cameraIdx, id, facePosition.pointer), 'GetTrackerFacePosition');
-    return facePosition;
-  }
-}
-
-final GetTrackerFacePosition = _GetTrackerFacePositionWrapper();
 
 class _GetTrackerFaceWrapper {
 
@@ -2611,6 +2734,12 @@ class _GetTrackerFaceWrapper {
   }
 }
 
+/// Get the face detected for an id.
+///
+/// - [tracker] the tracker to operate on
+/// - [cameraIdx] the camera index the frame was fed with
+/// - [id] the tracker id identifying a person
+/// - [face] optional instance to fill and return; reusing one across calls skips an allocation
 final GetTrackerFace = _GetTrackerFaceWrapper();
 
 class _LockIDWrapper {
@@ -2626,6 +2755,10 @@ class _LockIDWrapper {
   }
 }
 
+/// Prevent an id from being reassigned or purged.
+///
+/// - [tracker] the tracker to operate on
+/// - [id] the tracker id identifying a person
 final LockID = _LockIDWrapper();
 
 class _UnlockIDWrapper {
@@ -2641,6 +2774,10 @@ class _UnlockIDWrapper {
   }
 }
 
+/// Release a lock previously taken with `LockID`.
+///
+/// - [tracker] the tracker to operate on
+/// - [id] the tracker id identifying a person
 final UnlockID = _UnlockIDWrapper();
 
 class _PurgeIDWrapper {
@@ -2656,6 +2793,10 @@ class _PurgeIDWrapper {
   }
 }
 
+/// Remove an id from the tracker's memory.
+///
+/// - [tracker] the tracker to operate on
+/// - [id] the tracker id identifying a person
 final PurgeID = _PurgeIDWrapper();
 
 class _SetNameWrapper {
@@ -2676,6 +2817,11 @@ class _SetNameWrapper {
   }
 }
 
+/// Set the name associated with an id.
+///
+/// - [tracker] the tracker to operate on
+/// - [id] the tracker id identifying a person
+/// - [name] the name to associate with the id
 final SetName = _SetNameWrapper();
 
 class _GetNameWrapper {
@@ -2697,6 +2843,11 @@ class _GetNameWrapper {
   }
 }
 
+/// Get the name associated with an id.
+///
+/// - [tracker] the tracker to operate on
+/// - [id] the tracker id identifying a person
+/// - [maxSizeInBytes] size of the buffer allocated for the result
 final GetName = _GetNameWrapper();
 
 class _GetAllNamesWrapper {
@@ -2718,6 +2869,11 @@ class _GetAllNamesWrapper {
   }
 }
 
+/// Get every name associated with an id.
+///
+/// - [tracker] the tracker to operate on
+/// - [id] the tracker id identifying a person
+/// - [maxSizeInBytes] size of the buffer allocated for the result
 final GetAllNames = _GetAllNamesWrapper();
 
 class _GetIDReassignmentWrapper {
@@ -2739,6 +2895,10 @@ class _GetIDReassignmentWrapper {
   }
 }
 
+/// Get the id this id was reassigned to, if any.
+///
+/// - [tracker] the tracker to operate on
+/// - [id] the tracker id identifying a person
 final GetIDReassignment = _GetIDReassignmentWrapper();
 
 class _GetSimilarIDCountWrapper {
@@ -2760,6 +2920,10 @@ class _GetSimilarIDCountWrapper {
   }
 }
 
+/// Get the number of ids considered similar to this one.
+///
+/// - [tracker] the tracker to operate on
+/// - [id] the tracker id identifying a person
 final GetSimilarIDCount = _GetSimilarIDCountWrapper();
 
 class _GetSimilarIDListWrapper {
@@ -2777,6 +2941,11 @@ class _GetSimilarIDListWrapper {
   }
 }
 
+/// Get the ids considered similar to this one.
+///
+/// - [tracker] the tracker to operate on
+/// - [id] the tracker id identifying a person
+/// - [similarIDList] optional instance to fill and return; reusing one across calls skips an allocation
 final GetSimilarIDList = _GetSimilarIDListWrapper();
 
 class _SaveTrackerMemoryToFileWrapper {
@@ -2797,6 +2966,10 @@ class _SaveTrackerMemoryToFileWrapper {
   }
 }
 
+/// Save tracker memory to a file.
+///
+/// - [tracker] the tracker to operate on
+/// - [fileName] path to the file
 final SaveTrackerMemoryToFile = _SaveTrackerMemoryToFileWrapper();
 
 class _LoadTrackerMemoryFromFileWrapper {
@@ -2819,6 +2992,10 @@ class _LoadTrackerMemoryFromFileWrapper {
   }
 }
 
+/// Load tracker memory from a file.
+///
+/// - [fileName] path to the file
+/// - [tracker] optional instance to fill and return; reusing one across calls skips an allocation
 final LoadTrackerMemoryFromFile = _LoadTrackerMemoryFromFileWrapper();
 
 class _GetTrackerMemoryBufferSizeWrapper {
@@ -2840,23 +3017,30 @@ class _GetTrackerMemoryBufferSizeWrapper {
   }
 }
 
+/// Get the size in bytes needed to store the tracker's memory.
+///
+/// - [tracker] the tracker to operate on
 final GetTrackerMemoryBufferSize = _GetTrackerMemoryBufferSizeWrapper();
 
 class _SaveTrackerMemoryToBufferWrapper {
 
-  late int Function(int, Pointer<Uint8>) _func;
+  late int Function(int, Pointer<Uint8>, int) _func;
 
   _SaveTrackerMemoryToBufferWrapper() {
-    _func = _nativeLib.lookup<NativeFunction<Int32 Function(Uint32, Pointer<Uint8>)>>('FSDK_SaveTrackerMemoryToBuffer').asFunction();
+    _func = _nativeLib.lookup<NativeFunction<Int32 Function(Uint32, Pointer<Uint8>, Int64)>>('FSDK_SaveTrackerMemoryToBuffer').asFunction();
   }
 
   DataBuffer call(Tracker tracker, {DataBuffer? buffer}) {
     buffer ??= DataBuffer._allocate(tracker.bufferSize);
-    _checkErrorCode(_func(tracker.handle, buffer.pointer), 'SaveTrackerMemoryToBuffer');
+    _checkErrorCode(_func(tracker.handle, buffer.pointer, buffer.capacity), 'SaveTrackerMemoryToBuffer');
     return buffer;
   }
 }
 
+/// Save tracker memory to a buffer.
+///
+/// - [tracker] the tracker to operate on
+/// - [buffer] optional instance to fill and return; reusing one across calls skips an allocation
 final SaveTrackerMemoryToBuffer = _SaveTrackerMemoryToBufferWrapper();
 
 class _LoadTrackerMemoryFromBufferWrapper {
@@ -2874,6 +3058,10 @@ class _LoadTrackerMemoryFromBufferWrapper {
   }
 }
 
+/// Load tracker memory from a buffer.
+///
+/// - [buffer] the tracker memory to load
+/// - [tracker] optional instance to fill and return; reusing one across calls skips an allocation
 final LoadTrackerMemoryFromBuffer = _LoadTrackerMemoryFromBufferWrapper();
 
 class _GetTrackerFacialAttributeWrapper {
@@ -2897,6 +3085,13 @@ class _GetTrackerFacialAttributeWrapper {
   }
 }
 
+/// Get facial attribute values (angles, liveness, ...) for an id.
+///
+/// - [tracker] the tracker to operate on
+/// - [cameraIdx] the camera index the frame was fed with
+/// - [id] the tracker id identifying a person
+/// - [attributeName] the attribute to query, such as `Gender` or `Liveness`
+/// - [maxSizeInBytes] size of the buffer allocated for the result
 final GetTrackerFacialAttribute = _GetTrackerFacialAttributeWrapper();
 
 class _GetTrackerIDsCountWrapper {
@@ -2918,6 +3113,9 @@ class _GetTrackerIDsCountWrapper {
   }
 }
 
+/// Get the number of ids held by the tracker.
+///
+/// - [tracker] the tracker to operate on
 final GetTrackerIDsCount = _GetTrackerIDsCountWrapper();
 
 class _GetTrackerAllIDsWrapper {
@@ -2934,6 +3132,10 @@ class _GetTrackerAllIDsWrapper {
   }
 }
 
+/// Get every id held by the tracker.
+///
+/// - [tracker] the tracker to operate on
+/// - [ids] optional instance to fill and return; reusing one across calls skips an allocation
 final GetTrackerAllIDs = _GetTrackerAllIDsWrapper();
 
 class _GetTrackerFaceIDsCountForIDWrapper {
@@ -2954,6 +3156,10 @@ class _GetTrackerFaceIDsCountForIDWrapper {
   }
 }
 
+/// Get the number of face ids stored for an id.
+///
+/// - [tracker] the tracker to operate on
+/// - [id] the tracker id identifying a person
 final GetTrackerFaceIDsCountForID = _GetTrackerFaceIDsCountForIDWrapper();
 
 class _GetTrackerFaceIDsForIDWrapper {
@@ -2970,6 +3176,11 @@ class _GetTrackerFaceIDsForIDWrapper {
   }
 }
 
+/// Get the face ids stored for an id.
+///
+/// - [tracker] the tracker to operate on
+/// - [id] the tracker id identifying a person
+/// - [faceIDs] optional instance to fill and return; reusing one across calls skips an allocation
 final GetTrackerFaceIDsForID = _GetTrackerFaceIDsForIDWrapper();
 
 class _GetTrackerIDByFaceIDWrapper {
@@ -2990,6 +3201,10 @@ class _GetTrackerIDByFaceIDWrapper {
   }
 }
 
+/// Get the id a face id belongs to.
+///
+/// - [tracker] the tracker to operate on
+/// - [faceID] the face id identifying one stored face of a person
 final GetTrackerIDByFaceID = _GetTrackerIDByFaceIDWrapper();
 
 class _GetTrackerFaceTemplateWrapper {
@@ -3006,6 +3221,11 @@ class _GetTrackerFaceTemplateWrapper {
   }
 }
 
+/// Get the face template stored for a face id.
+///
+/// - [tracker] the tracker to operate on
+/// - [faceID] the face id identifying one stored face of a person
+/// - [faceTemplate] optional instance to fill and return; reusing one across calls skips an allocation
 final GetTrackerFaceTemplate = _GetTrackerFaceTemplateWrapper();
 
 class _GetTrackerFaceImageWrapper {
@@ -3022,6 +3242,11 @@ class _GetTrackerFaceImageWrapper {
   }
 }
 
+/// Get the face image stored for a face id.
+///
+/// - [tracker] the tracker to operate on
+/// - [faceID] the face id identifying one stored face of a person
+/// - [image] optional instance to fill and return; reusing one across calls skips an allocation
 final GetTrackerFaceImage = _GetTrackerFaceImageWrapper();
 
 class _SetTrackerFaceImageWrapper {
@@ -3036,6 +3261,11 @@ class _SetTrackerFaceImageWrapper {
   }
 }
 
+/// Store a face image for a face id.
+///
+/// - [tracker] the tracker to operate on
+/// - [faceID] the face id identifying one stored face of a person
+/// - [faceImage] the image to store
 final SetTrackerFaceImage = _SetTrackerFaceImageWrapper();
 
 class _DeleteTrackerFaceImageWrapper {
@@ -3050,8 +3280,13 @@ class _DeleteTrackerFaceImageWrapper {
   }
 }
 
+/// Delete the face image stored for a face id.
+///
+/// - [tracker] the tracker to operate on
+/// - [faceID] the face id identifying one stored face of a person
 final DeleteTrackerFaceImage = _DeleteTrackerFaceImageWrapper();
 
+/// The id and face id created for a face template.
 class TrackerCreateIDResult {
   final int id;
   final int faceID;
@@ -3079,6 +3314,10 @@ class _TrackerCreateIDWrapper {
   }
 }
 
+/// Create a new id from a face template.
+///
+/// - [tracker] the tracker to operate on
+/// - [faceTemplate] the face template to use
 final TrackerCreateID = _TrackerCreateIDWrapper();
 
 class _AddTrackerFaceTemplateWrapper {
@@ -3099,6 +3338,11 @@ class _AddTrackerFaceTemplateWrapper {
   }
 }
 
+/// Add a face template to an existing id.
+///
+/// - [tracker] the tracker to operate on
+/// - [id] the tracker id identifying a person
+/// - [faceTemplate] the face template to use
 final AddTrackerFaceTemplate = _AddTrackerFaceTemplateWrapper();
 
 class _DeleteTrackerFaceWrapper {
@@ -3113,8 +3357,13 @@ class _DeleteTrackerFaceWrapper {
   }
 }
 
+/// Delete a face from the tracker's memory.
+///
+/// - [tracker] the tracker to operate on
+/// - [faceID] the face id identifying one stored face of a person
 final DeleteTrackerFace = _DeleteTrackerFaceWrapper();
 
+/// The best matching tracker id and its similarity score.
 class IDSimilarityResult {
   final int id;
   final double similarity;
@@ -3132,19 +3381,26 @@ class _TrackerMatchFacesWrapper {
 
   IDSimilarities call(Tracker tracker, FaceTemplate faceTemplate, double threshold, {IDSimilarities? idSimilarities, int maxCount = 1024}) {
     idSimilarities ??= IDSimilarities.allocate(maxCount);
-    _checkErrorCode(_func(tracker.handle, faceTemplate.pointer, threshold, idSimilarities.pointer, idSimilarities._lengthPointer, idSimilarities.capacity), 'TrackerMatchFaces');
+    _checkErrorCode(_func(tracker.handle, faceTemplate.pointer, threshold, idSimilarities.pointer, idSimilarities._lengthPointer, sizeOf<IDSimilarity>() * idSimilarities.capacity), 'TrackerMatchFaces');
     return idSimilarities;
   }
 }
 
+/// Match a template against the tracker's memory.
+///
+/// - [tracker] the tracker to operate on
+/// - [faceTemplate] the face template to use
+/// - [threshold] the lowest similarity worth returning
+/// - [idSimilarities] optional instance to fill and return; reusing one across calls skips an allocation
+/// - [maxCount] the most results to return
 final TrackerMatchFaces = _TrackerMatchFacesWrapper();
 
 class _DetectFacialAttributeUsingFeaturesWrapper {
 
-  late int Function(int, Pointer<Point>, Pointer<Utf8>, Pointer<Utf8>, int) _func;
+  late int Function(int, Pointer<PointF>, Pointer<Utf8>, Pointer<Utf8>, int) _func;
 
   _DetectFacialAttributeUsingFeaturesWrapper() {
-    _func = _nativeLib.lookup<NativeFunction<Int32 Function(Uint32, Pointer<Point>, Pointer<Utf8>, Pointer<Utf8>, Int64)>>('FSDK_DetectFacialAttributeUsingFeatures').asFunction();
+    _func = _nativeLib.lookup<NativeFunction<Int32 Function(Uint32, Pointer<PointF>, Pointer<Utf8>, Pointer<Utf8>, Int64)>>('FSDK_DetectFacialAttributeUsingFeatures').asFunction();
   }
 
   String call(Image image, FacialFeatures facialFeatures, String attributeName, {int maxSizeInBytes = 256}) {
@@ -3160,7 +3416,42 @@ class _DetectFacialAttributeUsingFeaturesWrapper {
   }
 }
 
+/// Detect facial attribute values using facial key points.
+///
+/// - [image] the image to operate on
+/// - [facialFeatures] the key points of the face to inspect
+/// - [attributeName] the attribute to query, such as `Gender` or `Liveness`
+/// - [maxSizeInBytes] size of the buffer allocated for the result
 final DetectFacialAttributeUsingFeatures = _DetectFacialAttributeUsingFeaturesWrapper();
+
+class _DetectFacialAttributeUsingFaceWrapper {
+
+  late int Function(int, Pointer<_Face>, Pointer<Utf8>, Pointer<Utf8>, int) _func;
+
+  _DetectFacialAttributeUsingFaceWrapper() {
+    _func = _nativeLib.lookup<NativeFunction<Int32 Function(Uint32, Pointer<_Face>, Pointer<Utf8>, Pointer<Utf8>, Int64)>>('FSDK_DetectFacialAttributeUsingFace').asFunction();
+  }
+
+  String call(Image image, Face face, String attributeName, {int maxSizeInBytes = 256}) {
+    final var1 = attributeName.toNativeUtf8();
+    final var2 = malloc.allocate<Utf8>(maxSizeInBytes);
+    try {
+      _checkErrorCode(_func(image.handle, face.pointer, var1, var2, maxSizeInBytes), 'DetectFacialAttributeUsingFace');
+      return var2.toDartString();
+    } finally {
+      malloc.free(var2);
+      malloc.free(var1);
+    }
+  }
+}
+
+/// Detect facial attribute values using a detected face.
+///
+/// - [image] the image to operate on
+/// - [face] the face region to work within
+/// - [attributeName] the attribute to query, such as 'Gender' or 'Liveness'
+/// - [maxSizeInBytes] size of the buffer allocated for the result
+final DetectFacialAttributeUsingFace = _DetectFacialAttributeUsingFaceWrapper();
 
 class _GetValueConfidenceWrapper {
 
@@ -3185,6 +3476,10 @@ class _GetValueConfidenceWrapper {
   }
 }
 
+/// Get the confidence of `value` within a `key=value;` attribute string.
+///
+/// - [attributeValues] a `key=value;` string as returned by the attribute functions
+/// - [value] the value whose confidence to read
 final GetValueConfidence = _GetValueConfidenceWrapper();
 
 class _SetHTTPProxyWrapper {
@@ -3192,7 +3487,7 @@ class _SetHTTPProxyWrapper {
   late int Function(Pointer<Utf8>, int, Pointer<Utf8>, Pointer<Utf8>) _func;
 
   _SetHTTPProxyWrapper() {
-    _func = _nativeLib.lookup<NativeFunction<Int32 Function(Pointer<Utf8>, Int16, Pointer<Utf8>, Pointer<Utf8>)>>('FSDK_SetHTTPProxy').asFunction();
+    _func = _nativeLib.lookup<NativeFunction<Int32 Function(Pointer<Utf8>, Uint16, Pointer<Utf8>, Pointer<Utf8>)>>('FSDK_SetHTTPProxy').asFunction();
   }
 
   void call(String serverNameOrIPAddress, int port, String userName, String password) {
@@ -3209,6 +3504,12 @@ class _SetHTTPProxyWrapper {
   }
 }
 
+/// Set the HTTP proxy used for IP cameras.
+///
+/// - [serverNameOrIPAddress] the proxy host
+/// - [port] the proxy port
+/// - [userName] user name for the proxy, empty if it needs none
+/// - [password] password for the camera, empty if it needs none
 final SetHTTPProxy = _SetHTTPProxyWrapper();
 
 class _OpenIPVideoCameraWrapper {
@@ -3235,6 +3536,14 @@ class _OpenIPVideoCameraWrapper {
   }
 }
 
+/// Open an IP video camera.
+///
+/// - [compressionType] the stream compression used by the camera
+/// - [url] the camera stream address
+/// - [username] user name for the camera, empty if it needs none
+/// - [password] password for the camera, empty if it needs none
+/// - [timeoutSeconds] how long to wait for the camera before failing
+/// - [cameraHandle] optional instance to fill and return; reusing one across calls skips an allocation
 final OpenIPVideoCamera = _OpenIPVideoCameraWrapper();
 
 class _CloseVideoCameraWrapper {
@@ -3250,6 +3559,9 @@ class _CloseVideoCameraWrapper {
   }
 }
 
+/// Close the camera. It becomes invalid.
+///
+/// - [cameraHandle] the camera to close
 final CloseVideoCamera = _CloseVideoCameraWrapper();
 
 class _GrabFrameWrapper {
@@ -3267,6 +3579,10 @@ class _GrabFrameWrapper {
   }
 }
 
+/// Grab a frame from the camera.
+///
+/// - [cameraHandle] the camera to operate on
+/// - [image] optional instance to fill and return; reusing one across calls skips an allocation
 final GrabFrame = _GrabFrameWrapper();
 
 class _InitializeCapturingWrapper {
@@ -3282,6 +3598,7 @@ class _InitializeCapturingWrapper {
   }
 }
 
+/// Initialize the capturing subsystem.
 final InitializeCapturing = _InitializeCapturingWrapper();
 
 class _FinalizeCapturingWrapper {
@@ -3297,6 +3614,7 @@ class _FinalizeCapturingWrapper {
   }
 }
 
+/// Finalize the capturing subsystem.
 final FinalizeCapturing = _FinalizeCapturingWrapper();
 
 class _SetParameterWrapper {
@@ -3319,6 +3637,10 @@ class _SetParameterWrapper {
   }
 }
 
+/// Set a global SDK parameter.
+///
+/// - [parameterName] the name of the parameter
+/// - [parameterValue] the value to set
 final SetParameter = _SetParameterWrapper();
 
 class _SetParametersWrapper {
@@ -3341,13 +3663,18 @@ class _SetParametersWrapper {
   }
 }
 
+/// Set several global SDK parameters at once.
+///
+/// - [parameters] the parameters to set, as name/value pairs
 final SetParameters = _SetParametersWrapper();
 
+/// The writable directory the liveness data files are extracted into.
 Future<Directory> getCacheDirectory() async {
   final directory = await getApplicationCacheDirectory();
   return directory;
 }
 
+/// Whether a directory exists at [path].
 Future<bool> directoryExists(String path) async {
   final dir = Directory(path);
   if (await dir.exists()) {
@@ -3381,6 +3708,7 @@ Future<String> _copyAssets() async
     'data/internal/7484fdb5bb69d3283c8aacd885ee50d8ce53f21c7bbfc33509185fe239f2ad41',
     'data/internal/b333d4da1a385777d90cb4d335383cb28b10d5319f6a8417d963ed01b5abacdb',
     'data/pipelines/pegasus.json',
+    'data/pipelines/persephone.json',
     'data/preprocessing/face_params.conf',
     'data/quality/exposition.conf'
   ];
@@ -3416,6 +3744,10 @@ Future<String> _copyAssets() async
   return cacheDir.path;
 }
 
+/// Extract the bundled iBeta liveness data files and return the directory holding
+/// them. Pass that directory to the `LivenessModel` parameter as
+/// `external:dataDir=<path>/` before feeding any frames. Files already extracted
+/// are left alone, so calling this on every launch is cheap.
 Future<String> PrepareData() async {
   final dataDirectory = await _copyAssets();
   return dataDirectory;
