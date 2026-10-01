@@ -1,4 +1,5 @@
 import 'dart:ffi';
+import 'dart:typed_data';
 
 import 'package:camera/camera.dart';
 
@@ -82,24 +83,30 @@ class ImageConverter {
     _planes.length = 0;
   }
 
-  static void _planeToBuffer(Plane plane, DataBuffer buffer) {
-    final pointerList = buffer.pointer.asTypedList(plane.bytes.length);
-    pointerList.setAll(0, plane.bytes);
+  static void _bytesToBuffer(Uint8List bytes, DataBuffer buffer) {
+    final pointerList = buffer.pointer.asTypedList(bytes.length);
+    pointerList.setAll(0, bytes);
   }
 
   Image convert(CameraImage image) {
-    final info = ImageInfo.forImage(image);
+    return convertPlanes(
+      image.planes.map((plane) => plane.bytes).toList(growable: false),
+      ImageInfo.forImage(image)
+    );
+  }
+
+  Image convertPlanes(List<Uint8List> planes, ImageInfo info) {
     if (info != _info) {
       free();
 
-      _buffer = DataBuffer.allocate(image.width * image.height * 3);
-      _planes = image.planes.map((plane) => DataBuffer.allocate(plane.bytes.length)).toList();
+      _buffer = DataBuffer.allocate(info.width * info.height * 3);
+      _planes = planes.map((bytes) => DataBuffer.allocate(bytes.length)).toList();
 
       _info = info;
     }
 
     for (int i = 0; i < _planes.length; ++i) {
-      _planeToBuffer(image.planes[i], _planes[i]);
+      _bytesToBuffer(planes[i], _planes[i]);
     }
 
     switch (_info.imageFormatGroup) {
