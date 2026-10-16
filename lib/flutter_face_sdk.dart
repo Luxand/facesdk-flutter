@@ -1566,6 +1566,21 @@ class Tracker extends Freeable {
     DeleteTrackerFaceImage(this, faceID);
   }
 
+  /// Get the 5 facial feature points of the face image stored for a face id.
+  ///
+  /// - [faceID] the face id identifying one stored face of a person
+  List<Point> getFaceFeatures(int faceID) {
+    return GetTrackerFaceFeatures(this, faceID);
+  }
+
+  /// Replace the 5 facial feature points of the face image stored for a face id.
+  ///
+  /// - [faceID] the face id identifying one stored face of a person
+  /// - [features] 5 points in the coordinates of the stored face image
+  void setFaceFeatures(int faceID, List<Point> features) {
+    SetTrackerFaceFeatures(this, faceID, features);
+  }
+
   /// Create a new id from a face template.
   ///
   /// - [faceTemplate] the face template to use
@@ -3285,6 +3300,64 @@ class _DeleteTrackerFaceImageWrapper {
 /// - [tracker] the tracker to operate on
 /// - [faceID] the face id identifying one stored face of a person
 final DeleteTrackerFaceImage = _DeleteTrackerFaceImageWrapper();
+
+class _GetTrackerFaceFeaturesWrapper {
+  late int Function(int, int, Pointer<Point>) _func;
+
+  _GetTrackerFaceFeaturesWrapper() {
+    _func = _nativeLib.lookup<NativeFunction<Int32 Function(Uint32, Int64, Pointer<Point>)>>('FSDK_GetTrackerFaceFeatures').asFunction();
+  }
+
+  List<Point> call(Tracker tracker, int faceID) {
+    final features = malloc<Point>(5);
+    try {
+      _checkErrorCode(_func(tracker.handle, faceID, features), 'GetTrackerFaceFeatures');
+      return List<Point>.generate(5, (i) => Struct.create<Point>()
+        ..x = features[i].x
+        ..y = features[i].y);
+    } finally {
+      malloc.free(features);
+    }
+  }
+}
+
+/// Get the 5 facial feature points of the face image stored for a face id, in the coordinates of that image.
+///
+/// - [tracker] the tracker to operate on
+/// - [faceID] the face id identifying one stored face of a person
+final GetTrackerFaceFeatures = _GetTrackerFaceFeaturesWrapper();
+
+class _SetTrackerFaceFeaturesWrapper {
+  late int Function(int, int, Pointer<Point>) _func;
+
+  _SetTrackerFaceFeaturesWrapper() {
+    _func = _nativeLib.lookup<NativeFunction<Int32 Function(Uint32, Int64, Pointer<Point>)>>('FSDK_SetTrackerFaceFeatures').asFunction();
+  }
+
+  void call(Tracker tracker, int faceID, List<Point> features) {
+    if (features.length != 5) {
+      throw ArgumentError.value(features.length, 'features', '5 points expected');
+    }
+    final native = malloc<Point>(5);
+    try {
+      for (var i = 0; i < 5; ++i) {
+        native[i]
+          ..x = features[i].x
+          ..y = features[i].y;
+      }
+      _checkErrorCode(_func(tracker.handle, faceID, native), 'SetTrackerFaceFeatures');
+    } finally {
+      malloc.free(native);
+    }
+  }
+}
+
+/// Replace the 5 facial feature points of the face image stored for a face id.
+///
+/// - [tracker] the tracker to operate on
+/// - [faceID] the face id identifying one stored face of a person
+/// - [features] 5 points in the coordinates of the stored face image
+final SetTrackerFaceFeatures = _SetTrackerFaceFeaturesWrapper();
 
 /// The id and face id created for a face template.
 class TrackerCreateIDResult {
